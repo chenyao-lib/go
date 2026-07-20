@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/outrigdev/goid"
@@ -32,26 +33,26 @@ const (
 type Logger struct {
 	mu      sync.Mutex
 	prefix  string
-	level   Level
+	level   int32
 	dir     string
 	maxSize int64
+	console bool
 
 	logFile *os.File
 	logTime time.Time
 }
 
 var std = &Logger{
-	level:   LevelDebug, // 默认输出全部级别
+	level:   int32(LevelDebug), // 默认输出全部级别
 	prefix:  defaultPrefix,
 	dir:     defaultDir,
 	maxSize: defaultMaxSize,
+	console: true,
 }
 
 // Init 初始化日志配置。prefix 为文件名前缀，dir 为空时使用默认目录，maxSize 小于等于 0 时使用默认大小。
 func Init(prefix, dir string, maxSize int64, lv Level) {
-	if prefix == "" {
-		prefix = defaultPrefix
-	}
+	prefix = sanitizePrefix(prefix)
 	if dir == "" {
 		dir = defaultDir
 	}
@@ -65,7 +66,7 @@ func Init(prefix, dir string, maxSize int64, lv Level) {
 	std.prefix = prefix
 	std.dir = dir
 	std.maxSize = maxSize
-	std.level = lv
+	atomic.StoreInt32(&std.level, int32(lv))
 
 	if std.logFile != nil {
 		if err := std.logFile.Close(); err != nil {
@@ -74,6 +75,18 @@ func Init(prefix, dir string, maxSize int64, lv Level) {
 		std.logFile = nil
 		std.logTime = time.Time{}
 	}
+}
+
+// SetLevel 设置最低输出级别。低于此级别的日志将被忽略。
+func SetLevel(lv Level) {
+	atomic.StoreInt32(&std.level, int32(lv))
+}
+
+// SetConsole 设置是否输出到控制台。
+func SetConsole(enable bool) {
+	std.mu.Lock()
+	defer std.mu.Unlock()
+	std.console = enable
 }
 
 // Close 关闭日志文件。应在程序退出前调用。
@@ -133,6 +146,10 @@ func getStack() string {
 
 // Write 输出一条日志。
 func Write(lv Level, levelTag string, format string, args ...any) {
+	if !std.shouldLog(lv) {
+		return
+	}
+
 	msg := fmt.Sprintf(format, args...)
 	caller := getCaller(3)
 
@@ -145,7 +162,7 @@ func Write(lv Level, levelTag string, format string, args ...any) {
 	std.mu.Lock()
 	defer std.mu.Unlock()
 
-	if lv < std.level {
+	if !std.shouldLog(lv) {
 		return
 	}
 
@@ -168,7 +185,13 @@ func Write(lv Level, levelTag string, format string, args ...any) {
 			std.logTime = time.Time{}
 		}
 	}
-	fmt.Print(line)
+	if std.console {
+		fmt.Print(line)
+	}
+}
+
+func (l *Logger) shouldLog(lv Level) bool {
+	return lv >= Level(atomic.LoadInt32(&l.level))
 }
 
 func (l *Logger) rotate(t time.Time) error {
@@ -249,5 +272,42 @@ func nextBackupName(dir, baseName string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("stat logfile backup[%s]: %w", bak, err)
 		}
+	}
+}
+
+func sanitizePrefix(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return defaultPrefix
+	}
+
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range prefix {
+		if isUnsafePrefixRune(r) {
+			if !lastUnderscore {
+				b.WriteByte('_')
+				lastUnderscore = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		lastUnderscore = false
+	}
+
+	cleaned := strings.ReplaceAll(b.String(), "..", "_")
+	cleaned = strings.Trim(cleaned, "._ ")
+	if cleaned == "" {
+		return defaultPrefix
+	}
+	return cleaned
+}
+
+func isUnsafePrefixRune(r rune) bool {
+	switch r {
+	case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+		return true
+	default:
+		return r < 32
 	}
 }
