@@ -33,7 +33,7 @@ type Callback func(oldVal, newVal any)
 //		return err
 //	}
 //
-//	conf := config.Init[AppConfig]("myapp", tomlDecoder{}, ".toml")
+//	conf := config.Init[AppConfig]("./myapp.toml", tomlDecoder{})
 //
 // YAML example:
 //
@@ -52,7 +52,7 @@ type Callback func(oldVal, newVal any)
 //		return yaml.Unmarshal(data, v)
 //	}
 //
-//	conf := config.Init[AppConfig]("myapp", yamlDecoder{}, ".yaml", ".yml")
+//	conf := config.Init[AppConfig]("./myapp.yaml", yamlDecoder{})
 //
 // JSON example, using only the standard library:
 //
@@ -71,7 +71,7 @@ type Callback func(oldVal, newVal any)
 //		return json.Unmarshal(data, v)
 //	}
 //
-//	conf := config.Init[AppConfig]("myapp", jsonDecoder{}, ".json")
+//	conf := config.Init[AppConfig]("./myapp.json", jsonDecoder{})
 //
 // Advanced example, when you need FilePath, FileName, Debounce, or Watch=false:
 //
@@ -137,13 +137,12 @@ var (
 	defaultWait = 200 * time.Millisecond
 )
 
-// Init loads appName config into T and starts config file watching.
-func Init[T any](appName string, decoder Decoder, extensions ...string) *T {
+// Init loads filePath config into T and starts config file watching.
+func Init[T any](filePath string, decoder Decoder) *T {
 	loader := MustNewLoader[T](Options{
-		AppName:    appName,
-		Decoder:    decoder,
-		Extensions: extensions,
-		Watch:      true,
+		FilePath: filePath,
+		Decoder:  decoder,
+		Watch:    true,
 	})
 	return loader.MustLoad()
 }
