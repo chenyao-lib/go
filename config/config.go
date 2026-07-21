@@ -135,16 +135,60 @@ var (
 	globalCbMu  sync.RWMutex
 	globalCbs   = make(map[string][]Callback)
 	defaultWait = 200 * time.Millisecond
+
+	// 全局配置存储：保存最近一次通过 Init 或 Store 注册的配置，包级 Get[T]() 从中读取。
+	globalMu    sync.RWMutex
+	globalConf  any
+	globalValid bool
 )
 
 // Init loads filePath config into T and starts config file watching.
+// The loaded config is also registered globally so that other packages can
+// retrieve it later with Get[T]().
 func Init[T any](filePath string, decoder Decoder) *T {
 	loader := MustNewLoader[T](Options{
 		FilePath: filePath,
 		Decoder:  decoder,
 		Watch:    true,
 	})
-	return loader.MustLoad()
+	conf := loader.MustLoad()
+	Store(conf)
+	return conf
+}
+
+// Store registers a config instance as the global config so that other
+// packages can retrieve it with Get[T](). Typically you don't need to call
+// this manually — Init calls it automatically. Use it when you create a
+// Loader and call Load yourself.
+func Store[T any](conf *T) {
+	globalMu.Lock()
+	globalConf = conf
+	globalValid = true
+	globalMu.Unlock()
+}
+
+// Get returns the globally registered config of type T. Returns nil if no
+// config has been registered (via Init, Store, etc.) or the type does not
+// match.
+//
+// Usage:
+//
+//	cfg := config.Get[AppConfig]()
+//	if cfg == nil {
+//	    // not initialised
+//	}
+//	_ = cfg.SomeField
+func Get[T any]() *T {
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+	if !globalValid {
+		return nil
+	}
+	conf, ok := globalConf.(*T)
+	if !ok {
+		return nil
+	}
+	return conf
 }
 
 // LoadFile loads a specific config file once without watching it.
