@@ -64,8 +64,8 @@ func WithStrategy(s SelectStrategy) NodeWatcherOption {
 	}
 }
 
-// NewNodeWatcher 创建节点发现器
-func NewNodeWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOption) (*NodeWatcher, error) {
+// NewWatcher 创建节点发现器
+func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOption) (*NodeWatcher, error) {
 	log.Info("[WATCHER] connecting to etcd: %s", endpoints)
 
 	cli, err := clientv3.New(clientv3.Config{
@@ -284,7 +284,7 @@ func Init(etcdEndpoints, serverPrefix string, leaseTTL int, strategyType Strateg
 		return errors.New("unknown strategy type")
 	}
 
-	nw, err := NewNodeWatcher(etcdEndpoints, serverPrefix, leaseTTL, opt)
+	nw, err := NewWatcher(etcdEndpoints, serverPrefix, leaseTTL, opt)
 	if err != nil {
 		return err
 	}
