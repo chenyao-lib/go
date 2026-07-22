@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -131,17 +132,32 @@ func getCaller(skip int) string {
 }
 
 func getStack() string {
-	buf := make([]byte, 4096)
-	n := runtime.Stack(buf, false)
+	pcs := make([]uintptr, 32)
+	n := runtime.Callers(2, pcs) // 跳过 getStack 和 Write
 	if n == 0 {
 		return ""
 	}
-	lines := strings.SplitN(string(buf[:n]), "\n", 3)
-	// 跳过 runtime.Stack 和 getStack 自身两帧，从第3行开始
-	if len(lines) >= 3 {
-		return "\n" + strings.Join(lines[2:], "\n")
+	pcs = pcs[:n]
+
+	frames := runtime.CallersFrames(pcs)
+	var b strings.Builder
+	for {
+		frame, more := frames.Next()
+		// 跳过 log 包内部和 runtime 内部的帧
+		if !strings.Contains(frame.File, "log/log.go") && !strings.HasPrefix(frame.Function, "runtime.") {
+			b.WriteString("\n")
+			b.WriteString(filepath.Base(frame.File))
+			b.WriteString(":")
+			b.WriteString(strconv.Itoa(frame.Line))
+		}
+		if !more {
+			break
+		}
 	}
-	return string(buf[:n])
+	if b.Len() == 0 {
+		return ""
+	}
+	return b.String()
 }
 
 // Write 输出一条日志。
