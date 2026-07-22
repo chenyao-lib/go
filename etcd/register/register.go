@@ -1,8 +1,8 @@
-// Package etcd 提供通用的 etcd 服务注册功能
+// Package register 提供通用的 etcd 服务注册功能
 //
 // 使用方式：
 //
-//	reg, err := etcd.NewRegister("127.0.0.1:2379", etcd.RegisterOption{
+//	reg, err := register.NewRegister("127.0.0.1:2379", register.RegisterOption{
 //	    Key:   "services/gateway/gw-01",
 //	    Value: "1.2.3.4:8080",
 //	    TTL:   10,
@@ -12,13 +12,13 @@
 //
 // 支持自动重注册（默认开启）和动态 key/value：
 //
-//	reg := etcd.NewRegister("127.0.0.1:2379", etcd.RegisterOption{
+//	reg := register.NewRegister("127.0.0.1:2379", register.RegisterOption{
 //	    KeyFunc:   func() string { return "service/" + hostname },
 //	    ValueFunc: func() string { return getMyIP() },
 //	    TTL: 10,
 //	})
 //	reg.Register()
-package etcd
+package register
 
 import (
 	"context"
