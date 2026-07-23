@@ -4,6 +4,7 @@ go 1.26
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0
+	github.com/coder/websocket v1.8.15
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/outrigdev/goid v0.3.0
 	go.etcd.io/etcd/client/v3 v3.7.0
