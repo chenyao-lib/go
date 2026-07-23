@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"redeemserver/framework/payloadcodec"
+	"github.com/chenyao-lib/go/payloadcodec"
 )
 
 func (c *Client) marshalRPCMessage(msg RPCMessage) ([]byte, error) {
