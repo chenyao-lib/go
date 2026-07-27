@@ -187,8 +187,7 @@ func Write(lv Level, levelTag string, format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "rotate logfile error: %v\n", err)
 	}
 
-	prefix := fmt.Sprintf("%04d-%02d-%02d %02d:%02d:%02d|%s",
-		t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), levelTag)
+	prefix := t.UTC().Format("2006-01-02 15:04:05.000000000Z") + "|" + levelTag
 
 	line := prefix + caller + msg + stack + "\r\n"
 	if std.logFile != nil {
