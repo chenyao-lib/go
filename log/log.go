@@ -25,30 +25,33 @@ const (
 )
 
 const (
-	defaultPrefix  = "log"
-	defaultDir     = "logs"
-	defaultMaxSize = 100 * 1024 * 1024 // 100MB
+	defaultPrefix   = "log"
+	defaultDir      = "logs"
+	defaultMaxSize  = 100 * 1024 * 1024 // 100MB
+	timestampLayout = "2006-01-02 15:04:05.000000000"
 )
 
 // Logger 全局日志实例（包内单例）
 type Logger struct {
-	mu      sync.Mutex
-	prefix  string
-	level   int32
-	dir     string
-	maxSize int64
-	console bool
+	mu       sync.Mutex
+	prefix   string
+	level    int32
+	dir      string
+	maxSize  int64
+	console  bool
+	location *time.Location
 
 	logFile *os.File
 	logTime time.Time
 }
 
 var std = &Logger{
-	level:   int32(LevelDebug), // 默认输出全部级别
-	prefix:  defaultPrefix,
-	dir:     defaultDir,
-	maxSize: defaultMaxSize,
-	console: true,
+	level:    int32(LevelDebug), // 默认输出全部级别
+	prefix:   defaultPrefix,
+	dir:      defaultDir,
+	maxSize:  defaultMaxSize,
+	console:  true,
+	location: time.Local,
 }
 
 // Init 初始化日志配置。prefix 为文件名前缀，dir 为空时使用默认目录，maxSize 小于等于 0 时使用默认大小。
@@ -88,6 +91,20 @@ func SetConsole(enable bool) {
 	std.mu.Lock()
 	defer std.mu.Unlock()
 	std.console = enable
+}
+
+// SetTimezone 设置日志时区。name 为空或为 Local 时使用服务器当地时区。
+// 使用 Asia/Shanghai 可让不同服务器统一显示北京时间。
+func SetTimezone(name string) error {
+	location, err := resolveTimezone(name)
+	if err != nil {
+		return err
+	}
+
+	std.mu.Lock()
+	defer std.mu.Unlock()
+	std.location = location
+	return nil
 }
 
 // Close 关闭日志文件。应在程序退出前调用。
@@ -182,12 +199,12 @@ func Write(lv Level, levelTag string, format string, args ...any) {
 		return
 	}
 
-	t := time.Now()
+	t := time.Now().In(std.location)
 	if err := std.rotate(t); err != nil {
 		fmt.Fprintf(os.Stderr, "rotate logfile error: %v\n", err)
 	}
 
-	prefix := t.UTC().Format("2006-01-02 15:04:05.000000000Z") + "|" + levelTag
+	prefix := t.Format(timestampLayout) + "|" + levelTag
 
 	line := prefix + caller + msg + stack + "\r\n"
 	if std.logFile != nil {
@@ -207,6 +224,22 @@ func Write(lv Level, levelTag string, format string, args ...any) {
 
 func (l *Logger) shouldLog(lv Level) bool {
 	return lv >= Level(atomic.LoadInt32(&l.level))
+}
+
+func resolveTimezone(name string) (*time.Location, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.EqualFold(name, "Local") {
+		return time.Local, nil
+	}
+	if strings.EqualFold(name, "Asia/Shanghai") {
+		return time.FixedZone("Asia/Shanghai", 8*60*60), nil
+	}
+
+	location, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("load timezone[%s]: %w", name, err)
+	}
+	return location, nil
 }
 
 func (l *Logger) rotate(t time.Time) error {
