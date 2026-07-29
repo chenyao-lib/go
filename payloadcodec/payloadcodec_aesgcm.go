@@ -62,28 +62,6 @@ func NewAESGCMCodec(base64Key, keyID string) (*AESGCMCodec, error) {
 	}, nil
 }
 
-func NewFactory(algorithm, base64Key, keyID string) (Factory, error) {
-	if _, err := NewCodec(algorithm, base64Key, keyID); err != nil {
-		return nil, err
-	}
-
-	return func(_, _ string) (Codec, error) {
-		return NewCodec(algorithm, base64Key, keyID)
-	}, nil
-}
-
-// NewCodec constructs a codec from one persisted login credential.
-func NewCodec(algorithm, base64Key, keyID string) (Codec, error) {
-	algorithm = strings.TrimSpace(algorithm)
-	if algorithm == "" {
-		algorithm = AESGCMV1
-	}
-	if algorithm != AESGCMV1 {
-		return nil, fmt.Errorf("unsupported client payload algorithm %q", algorithm)
-	}
-	return NewAESGCMCodec(base64Key, keyID)
-}
-
 func (c *AESGCMCodec) Encode(meta Meta, plaintext []byte) (json.RawMessage, error) {
 	if len(plaintext) > maxPlaintextSize {
 		return nil, fmt.Errorf("plaintext exceeds %d bytes", maxPlaintextSize)
