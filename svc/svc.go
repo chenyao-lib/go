@@ -86,8 +86,8 @@ type Instance interface {
 	Name() string
 	Start() error
 	Stop()
-	Request(ctx context.Context, method string, args any) (any, error)
-	Post(ctx context.Context, method string, args any) error
+	RawCall(ctx context.Context, method string, args any) (any, error)
+	RawSend(ctx context.Context, method string, args any) error
 }
 
 type ConfigProvider interface {
@@ -528,14 +528,14 @@ func (s *Service) drainRemaining() {
 
 // ==================== 同步 RPC ====================
 
-func (s *Service) Request(ctx context.Context, method string, args any) (any, error) {
+func (s *Service) RawCall(ctx context.Context, method string, args any) (any, error) {
 	if s.state.Load() != int32(StateRunning) {
 		return nil, ErrServiceNotRunning
 	}
 	if ctx != nil && ctx.Value(handlerCtxKey{}) != nil {
 		return nil, ErrExternalOnly
 	}
-	return s.request(ctx, method, args)
+	return s.rawCall(ctx, method, args)
 }
 
 func (s *Service) Call(ctx context.Context, targetService, method string, args any) (any, error) {
@@ -560,7 +560,7 @@ func (s *Service) Call(ctx context.Context, targetService, method string, args a
 		defer s.acquireExecToken()
 	}
 
-	return target.request(ctx, method, args)
+	return target.rawCall(ctx, method, args)
 }
 
 func (s *Service) releaseExecToken() {
@@ -571,7 +571,7 @@ func (s *Service) acquireExecToken() {
 	<-s.execToken
 }
 
-func (s *Service) request(parent context.Context, method string, args any) (any, error) {
+func (s *Service) rawCall(parent context.Context, method string, args any) (any, error) {
 	session := s.nextSession()
 	rspCh := make(chan *ServiceMsg, 1)
 
@@ -646,7 +646,7 @@ func (s *Service) Sleep(ctx context.Context, d time.Duration) {
 
 // ==================== 异步发送 ====================
 
-func (s *Service) Post(ctx context.Context, method string, args any) error {
+func (s *Service) RawSend(ctx context.Context, method string, args any) error {
 	if s.state.Load() != int32(StateRunning) {
 		return ErrServiceNotRunning
 	}

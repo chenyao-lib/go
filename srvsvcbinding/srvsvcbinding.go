@@ -147,7 +147,7 @@ func (b *ClientServiceBinding) onClientClose(c *srv.Client) {
 	}
 }
 
-// handleMessage 先执行全部消息守卫，再根据 Session 区分 Request 和 Post。
+// handleMessage 先执行全部消息守卫，再根据 Session 区分 RawCall 和 RawSend。
 // 中间件拒绝消息时，业务 Service 不会收到该消息。
 func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) (any, error) {
 	value, ok := b.states.Load(c)
@@ -167,9 +167,9 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 	}
 
 	if msg.Session != "" {
-		return state.service.Request(ctx, msg.Method, msg.Data)
+		return state.service.RawCall(ctx, msg.Method, msg.Data)
 	}
-	return nil, state.service.Post(ctx, msg.Method, msg.Data)
+	return nil, state.service.RawSend(ctx, msg.Method, msg.Data)
 }
 
 // stopConnection 先停止业务 Service，再逆序清理已经 ready 的中间件。

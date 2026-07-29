@@ -7,6 +7,7 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/outrigdev/goid v0.3.0
+	github.com/redis/go-redis/v9 v9.21.0
 	go.etcd.io/etcd/client/v3 v3.7.0
 )
 
@@ -17,6 +18,7 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	go.etcd.io/etcd/api/v3 v3.7.0 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.7.0 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect
 	golang.org/x/net v0.55.0 // indirect
