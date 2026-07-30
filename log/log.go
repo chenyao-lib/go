@@ -122,19 +122,19 @@ func Close() {
 // ==================== 对外接口 ====================
 
 func Info(format string, args ...any) {
-	Write(LevelInfo, "INFO", " "+format, args...)
+	Write(LevelInfo, "INFO", true, format, args...)
 }
 
 func Error(format string, args ...any) {
-	Write(LevelError, "ERROR", " "+format, args...)
+	Write(LevelError, "ERROR", true, format, args...)
 }
 
 func Warn(format string, args ...any) {
-	Write(LevelWarn, "WARN", " "+format, args...)
+	Write(LevelWarn, "WARN", true, format, args...)
 }
 
 func Debug(format string, args ...any) {
-	Write(LevelDebug, "DEBUG", " "+format, args...)
+	Write(LevelDebug, "DEBUG", true, format, args...)
 }
 
 // ==================== 内部实现 ====================
@@ -178,12 +178,15 @@ func getStack() string {
 }
 
 // Write 输出一条日志。
-func Write(lv Level, levelTag string, format string, args ...any) {
+func Write(lv Level, levelTag string, leadingSpace bool, format string, args ...any) {
 	if !std.shouldLog(lv) {
 		return
 	}
 
 	msg := fmt.Sprintf(format, args...)
+	if leadingSpace {
+		msg = " " + msg
+	}
 	caller := getCaller(3)
 
 	// Error 级别附加调用栈

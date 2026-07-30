@@ -190,26 +190,19 @@ func NewService(def Definition) *Service {
 }
 
 func (s *Service) Info(format string, args ...any) {
-	log.Write(log.LevelInfo, "INFO", "%s| "+format, s.logArgs(args)...)
+	log.Write(log.LevelInfo, "INFO", false, "%s| %s", s.name, fmt.Sprintf(format, args...))
 }
 
 func (s *Service) Warn(format string, args ...any) {
-	log.Write(log.LevelWarn, "WARN", "%s| "+format, s.logArgs(args)...)
+	log.Write(log.LevelWarn, "WARN", false, "%s| %s", s.name, fmt.Sprintf(format, args...))
 }
 
 func (s *Service) Error(format string, args ...any) {
-	log.Write(log.LevelError, "ERROR", "%s| "+format, s.logArgs(args)...)
+	log.Write(log.LevelError, "ERROR", false, "%s| %s", s.name, fmt.Sprintf(format, args...))
 }
 
 func (s *Service) Debug(format string, args ...any) {
-	log.Write(log.LevelDebug, "DEBUG", "%s| "+format, s.logArgs(args)...)
-}
-
-func (s *Service) logArgs(args []any) []any {
-	out := make([]any, 0, len(args)+1)
-	out = append(out, s.name)
-	out = append(out, args...)
-	return out
+	log.Write(log.LevelDebug, "DEBUG", false, "%s| %s", s.name, fmt.Sprintf(format, args...))
 }
 
 func (s *Service) SetConfig(cfg ServiceConfig) {
