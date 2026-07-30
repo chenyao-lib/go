@@ -1,3 +1,60 @@
+// Package config 提供泛型配置加载、文件查找、热更新、字段变更回调和简单的
+// 进程级配置存取。解析格式由调用方通过 Decoder 注入，因此可用于 JSON、
+// YAML、TOML 或其他格式。
+//
+// # 快速加载
+//
+// 使用 DecoderFunc 可以直接接入标准库 JSON：
+//
+//	type AppConfig struct {
+//		Server struct {
+//			Addr string `json:"addr"`
+//		} `json:"server"`
+//	}
+//
+//	decoder := config.DecoderFunc(func(path string, v any) error {
+//		data, err := os.ReadFile(path)
+//		if err != nil {
+//			return err
+//		}
+//		return json.Unmarshal(data, v)
+//	})
+//
+//	cfg := config.Init[AppConfig]("./app.json", decoder)
+//	log.Info("server addr: %s", cfg.Server.Addr)
+//
+// Init 会立即加载指定文件、开启目录监听，并通过 Store 注册初始配置，使其他
+// 包可用 config.Get[AppConfig]() 获取。LoadFile 只加载一次，不启动监听。
+//
+// # 独立 Loader
+//
+// 需要控制文件查找、监听开关或防抖时间时使用 Loader：
+//
+//	loader := config.MustNewLoader[AppConfig](config.Options{
+//		AppName:    "gateway",
+//		Extensions: []string{".json"},
+//		Decoder:    decoder,
+//		Watch:      true,
+//		Debounce:   500 * time.Millisecond,
+//	})
+//	loader.OnChange("server.addr", func(oldValue, newValue any) {
+//		log.Info("addr: %v -> %v", oldValue, newValue)
+//	})
+//	cfg := loader.MustLoad()
+//
+// FilePath 指定精确路径；FileName 会依次在可执行文件目录和工作目录查找；
+// AppName+Extensions 会按扩展名依次查找。三种方式只需选择一种。
+//
+// 热更新时 Loader 会替换内部配置指针，因此长期运行的代码应调用 loader.Get()
+// 读取最新快照，不要永久保存首次 Load 返回的指针。若使用包级 Get，调用方应在
+// 自己管理 Loader 时显式调用 Store 注册希望全局暴露的配置。
+//
+// # 变更回调
+//
+// 字段路径不区分大小写，路径名依次取 toml、yaml、json 标签，最后才使用 Go
+// 字段名。嵌套字段用点连接，例如 server.addr。Loader.OnChange 只作用于该
+// Loader；包级 OnChange 作用于所有 Loader。回调在独立 goroutine 中执行，
+// 调用方应自行保证共享状态的并发安全。
 package config
 
 import (
@@ -271,7 +328,7 @@ func callCallbacks(callbacks map[string][]Callback, mu *sync.RWMutex, key string
 		go func(f Callback) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Error("Recovered from config callback error: %v", r)
+					log.Error("[CONFIG] 配置变更回调 panic: path=%s, panic=%v", key, r)
 				}
 			}()
 			f(oldVal, newVal)
@@ -282,15 +339,17 @@ func callCallbacks(callbacks map[string][]Callback, mu *sync.RWMutex, key string
 // Load reads the config file and starts watching it when enabled.
 func (l *Loader[T]) Load() (*T, error) {
 	if err := l.loadAndProcess(); err != nil {
+		log.Error("[CONFIG] 配置加载失败: path=%s, err=%v", l.path, err)
 		return nil, err
 	}
 	if l.watch {
 		if err := l.startWatch(); err != nil {
+			log.Error("[CONFIG] 配置监听启动失败: path=%s, dir=%s, err=%v", l.path, l.dir, err)
 			return nil, err
 		}
-		fmt.Println("Load config success, watch config dir: ", l.dir)
+		log.Info("[CONFIG] 配置加载成功，已启动监听: path=%s, dir=%s", l.path, l.dir)
 	} else {
-		fmt.Println("Load config success: ", l.path)
+		log.Info("[CONFIG] 配置加载成功: path=%s", l.path)
 	}
 	return l.Get(), nil
 }
@@ -327,7 +386,7 @@ func (l *Loader[T]) loadAndProcess() error {
 	l.mu.Unlock()
 
 	if !isFirstLoad {
-		log.Info("Config change detected (%s):", time.Now().Format("15:04:05"))
+		log.Info("[CONFIG] 检测到配置变化: path=%s, time=%s", l.path, time.Now().Format("15:04:05"))
 		diffConfig(oldConf, newConf, "", l.triggerCallbacks)
 	}
 	return nil
@@ -377,9 +436,9 @@ func (l *Loader[T]) startWatch() error {
 				}
 				timer = time.AfterFunc(l.debounce, func() {
 					if err := l.loadAndProcess(); err != nil {
-						log.Error("Load config error: %v", err)
+						log.Error("[CONFIG] 自动加载配置失败: path=%s, err=%v", l.path, err)
 					} else {
-						log.Info("Auto load config success")
+						log.Info("[CONFIG] 自动加载配置成功: path=%s", l.path)
 					}
 				})
 				mu.Unlock()
@@ -388,7 +447,7 @@ func (l *Loader[T]) startWatch() error {
 				if !ok {
 					return
 				}
-				log.Error("Watcher error occurred: %v", err)
+				log.Error("[CONFIG] 文件监听异常: path=%s, err=%v", l.path, err)
 			}
 		}
 	}()
@@ -594,14 +653,14 @@ func logChange(path string, oldVal, newVal reflect.Value) {
 	newAny := valueOf(newVal)
 
 	if oldEmpty && !newEmpty {
-		log.Info("[ADD] %s = %v", path, newAny)
+		log.Info("[CONFIG][ADD] %s = %v", path, newAny)
 		return
 	}
 	if !oldEmpty && newEmpty {
-		log.Info("[DELETE] %s: remove (original %v)", path, oldAny)
+		log.Info("[CONFIG][DELETE] %s: remove (original %v)", path, oldAny)
 		return
 	}
-	log.Info("[MODIFY] %s: %v -> %v", path, oldAny, newAny)
+	log.Info("[CONFIG][MODIFY] %s: %v -> %v", path, oldAny, newAny)
 }
 
 func isZero(v reflect.Value) bool {

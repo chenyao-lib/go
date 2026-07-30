@@ -1,3 +1,64 @@
+// Package srv 提供带认证、客户端分组、双向 RPC 和优雅关闭的 WebSocket 服务端。
+// 服务固定在 /ws 路径接受连接。
+//
+// # 启动服务
+//
+//	server := srv.NewServer(":8080")
+//	server.SetOriginPatterns("https://example.com")
+//	server.SetHandlerQueueSize(1024)
+//
+//	server.RegisterHandler("worker", "job.run", func(
+//		client *srv.Client,
+//		data json.RawMessage,
+//	) (any, error) {
+//		var req RunRequest
+//		if err := json.Unmarshal(data, &req); err != nil {
+//			return nil, err
+//		}
+//		return RunResponse{Accepted: true}, nil
+//	})
+//
+//	go func() {
+//		if err := server.Start(); err != nil {
+//			log.Error("server stopped: %v", err)
+//		}
+//	}()
+//
+// Start 会阻塞到 HTTP 服务退出，通常在 goroutine 中启动。程序退出时使用带
+// 截止时间的 context 调用 Shutdown：
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+//	defer cancel()
+//	_ = server.Shutdown(ctx)
+//
+// # 认证
+//
+// 默认认证器接受包含 type 和 id 的 AuthMessage。生产环境可调用
+// SetAuthenticator 校验令牌并返回规范化后的客户端类型、ID 和可选 Codec：
+//
+//	server.SetAuthenticator(func(
+//		ctx context.Context,
+//		client *srv.Client,
+//		data []byte,
+//	) (*srv.AuthResult, error) {
+//		// 校验 data 后返回身份；返回错误会拒绝连接。
+//		return &srv.AuthResult{Type: "worker", ID: "worker-01"}, nil
+//	})
+//
+// AuthResult.Codec 非 nil 时只加密 RPCMessage.Data，协议外层仍为 JSON。客户端
+// 必须配置兼容的 payloadcodec.Codec。
+//
+// # 消息路由和客户端操作
+//
+// RegisterHandler 按 clientType 和 method 路由；RegisterDefaultHandler 处理
+// 未注册方法。对于已连接客户端，可通过 GetClientByID、WalkClient 或
+// SendByID 查找和推送；Client.Call/CallT 可由服务端反向调用客户端并等待响应。
+//
+// SetOnClientReady 和 SetOnClientClose 注册连接生命周期回调。使用
+// srvsvcbinding 时不要再覆盖这两个回调或默认 Handler，因为 binding 会接管它们。
+//
+// NewServer 为兼容旧行为默认允许所有 Origin。对外服务应显式调用
+// SetOriginPatterns 设置可信来源。
 package srv
 
 import (
@@ -520,17 +581,19 @@ func (s *WsServer) Start() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Info("WebSocket Server 运行在 %s", s.WsPort)
+	log.Info("[SRV] WebSocket 服务启动: addr=%s, path=/ws", s.WsPort)
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Error("%+v", err)
+		log.Error("[SRV] WebSocket 服务异常退出: addr=%s, err=%v", s.WsPort, err)
 		return err
 	}
+	log.Info("[SRV] WebSocket 服务已停止: addr=%s", s.WsPort)
 	return nil
 }
 
 // Shutdown 优雅关闭服务
 func (s *WsServer) Shutdown(ctx context.Context) error {
 	if s.httpServer == nil {
+		log.Debug("[SRV] 服务尚未启动，无需关闭: addr=%s", s.WsPort)
 		return nil
 	}
 	log.Info("开始优雅关闭 WebSocket 服务器...")

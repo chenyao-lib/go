@@ -1,3 +1,53 @@
+// Package httpapi 提供约定式 HTTP API 客户端，支持 JSON 数据信封、URL 编码
+// 表单、multipart 表单以及可插拔的请求/响应加解密。
+//
+// # JSON API
+//
+//	type CreateRequest struct {
+//		Name string `json:"name"`
+//	}
+//	type CreateResponse struct {
+//		ID string `json:"id"`
+//	}
+//
+//	client := httpapi.NewHttpClient(5, nil)
+//	var result CreateResponse
+//	err := client.Call(
+//		"https://api.example.com/create",
+//		CreateRequest{Name: "demo"},
+//		"zh-CN",
+//		&result,
+//	)
+//
+// Call 会把业务请求编码到 data 字段，并附带 lang 和纳秒时间戳。服务端响应应为：
+//
+//	{"code":0,"msg":"","data":"...","timestamp":0,"signature":""}
+//
+// out 必须是可由 json.Unmarshal 写入的指针。code 非 0 时返回 *APIError；
+// 可通过 errors.As 读取业务错误码：
+//
+//	var apiErr *httpapi.APIError
+//	if errors.As(err, &apiErr) {
+//		log.Warn("api error: code=%d, msg=%s", apiErr.Code, apiErr.Msg)
+//	}
+//
+// timeoutSecs 不在 1 到 120 秒范围内时使用 5 秒。
+//
+// # 加密客户端
+//
+// 内置 AESCipher 使用 base64 编码的 16、24 或 32 字节 AES 密钥：
+//
+//	client, err := httpapi.NewAesCipherClient(5, base64Key)
+//
+// 也可实现 Encryptor 并传给 NewHttpClient。nil Encryptor 表示 data 字段直接
+// 承载明文 JSON 字符串。内置实现用于兼容 AES-CBC+PKCS#7 协议；新协议若需要
+// 防篡改能力，应优先使用带认证的加密设计。
+//
+// # 表单接口
+//
+// CallFormMap 将业务请求编码到 application/x-www-form-urlencoded 的 __input
+// 字段，并将成功响应解析为 map[string]any。RequestForm 发送 multipart/form-data
+// 字符串字段并返回原始响应体。两者都会把非 200 HTTP 状态作为错误返回。
 package httpapi
 
 import (
@@ -64,10 +114,12 @@ func NewHttpClient(timeoutSecs int, encryptor Encryptor) *HttpClient {
 	if timeoutSecs <= 0 || timeoutSecs > 120 {
 		timeoutSecs = 5
 	}
-	return &HttpClient{
+	client := &HttpClient{
 		httpClient: &http.Client{Timeout: time.Duration(timeoutSecs) * time.Second},
 		encryptor:  encryptor,
 	}
+	log.Info("[HTTPAPI] 客户端创建完成: timeout=%ds, encryptor=%T", timeoutSecs, encryptor)
+	return client
 }
 
 // NewAesCipherClient creates a client using the built-in AES cipher.
@@ -77,8 +129,16 @@ func NewAesCipherClient(timeoutSecs int, base64Key string) (*HttpClient, error) 
 
 // Call sends a JSON request using the API data envelope and decodes its
 // response into out.
-func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) error {
+func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) (callErr error) {
 	startedAt := time.Now()
+	defer func() {
+		if callErr != nil {
+			log.Error("[HTTPAPI] JSON API 调用失败: url=%s, cost=%s, err=%v", reqURL, time.Since(startedAt), callErr)
+		} else {
+			log.Info("[HTTPAPI] JSON API 调用成功: url=%s, cost=%s", reqURL, time.Since(startedAt))
+		}
+	}()
+
 	reqBytes, err := json.Marshal(reqBody)
 	if err != nil {
 		return fmt.Errorf("marshal API request: %w", err)
@@ -113,13 +173,21 @@ func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) erro
 	if err := c.decryptData(apiResp.Data, out); err != nil {
 		return err
 	}
-	log.Info("http api success: url=%s, cost=%s", reqURL, time.Since(startedAt))
 	return nil
 }
 
 // CallFormMap sends reqBody in the __input form field and returns the decoded
 // response data as a map.
-func (c *HttpClient) CallFormMap(reqURL string, reqBody any) (map[string]any, error) {
+func (c *HttpClient) CallFormMap(reqURL string, reqBody any) (result map[string]any, callErr error) {
+	startedAt := time.Now()
+	defer func() {
+		if callErr != nil {
+			log.Error("[HTTPAPI] URL 编码表单调用失败: url=%s, cost=%s, err=%v", reqURL, time.Since(startedAt), callErr)
+		} else {
+			log.Info("[HTTPAPI] URL 编码表单调用成功: url=%s, cost=%s", reqURL, time.Since(startedAt))
+		}
+	}()
+
 	reqBytes, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("marshal form request: %w", err)
@@ -264,13 +332,26 @@ func (c *HttpClient) requestJSON(reqURL string, reqMethod string, reqBody any) (
 }
 
 // RequestForm sends a multipart form request and returns its raw response body.
-func (c *HttpClient) RequestForm(reqURL string, fields map[string]string) ([]byte, error) {
+func (c *HttpClient) RequestForm(reqURL string, fields map[string]string) (result []byte, callErr error) {
+	startedAt := time.Now()
+	defer func() {
+		if callErr != nil {
+			log.Error("[HTTPAPI] multipart 表单调用失败: url=%s, cost=%s, err=%v", reqURL, time.Since(startedAt), callErr)
+		} else {
+			log.Info("[HTTPAPI] multipart 表单调用成功: url=%s, cost=%s", reqURL, time.Since(startedAt))
+		}
+	}()
+
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	for k, v := range fields {
-		_ = writer.WriteField(k, v)
+		if err := writer.WriteField(k, v); err != nil {
+			return nil, fmt.Errorf("write form field %q: %w", k, err)
+		}
 	}
-	_ = writer.Close()
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("close multipart writer: %w", err)
+	}
 	req, err := http.NewRequest(http.MethodPost, reqURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("create form request: %w", err)

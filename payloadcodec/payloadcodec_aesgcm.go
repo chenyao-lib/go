@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/chenyao-lib/go/log"
 )
 
 const (
@@ -45,21 +47,27 @@ type AESGCMCodec struct {
 func NewAESGCMCodec(base64Key, keyID string) (*AESGCMCodec, error) {
 	keyText := strings.TrimSpace(base64Key)
 	if keyText == "" {
-		return nil, errors.New("client payload key is empty")
+		err := errors.New("client payload key is empty")
+		log.Error("[PAYLOADCODEC] AES-GCM 初始化失败: key_id=%s, err=%v", keyID, err)
+		return nil, err
 	}
 
 	key, err := base64.StdEncoding.DecodeString(keyText)
 	if err != nil {
+		log.Error("[PAYLOADCODEC] AES-GCM 密钥解码失败: key_id=%s, err=%v", keyID, err)
 		return nil, fmt.Errorf("decode client payload key: %w", err)
 	}
 	if _, err := aes.NewCipher(key); err != nil {
+		log.Error("[PAYLOADCODEC] AES-GCM 密钥无效: key_id=%s, err=%v", keyID, err)
 		return nil, fmt.Errorf("invalid client payload key: %w", err)
 	}
 
-	return &AESGCMCodec{
+	codec := &AESGCMCodec{
 		key:   append([]byte(nil), key...),
 		keyID: strings.TrimSpace(keyID),
-	}, nil
+	}
+	log.Info("[PAYLOADCODEC] AES-GCM 初始化成功: key_id=%s", codec.keyID)
+	return codec, nil
 }
 
 func (c *AESGCMCodec) Encode(meta Meta, plaintext []byte) (json.RawMessage, error) {

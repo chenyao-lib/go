@@ -1,23 +1,51 @@
-// Package register 提供通用的 etcd 服务注册功能
+// Package register 提供基于 etcd 租约的服务注册、保活和重新注册。
 //
-// 使用方式：
+// # 静态注册
 //
-//	reg, err := register.NewRegister("127.0.0.1:2379", register.RegisterOption{
-//	    Key:   "services/gateway/gw-01",
-//	    Value: "1.2.3.4:8080",
-//	    TTL:   10,
+//	reg, err := register.NewRegister(
+//		"127.0.0.1:2379,127.0.0.2:2379",
+//		register.RegisterOption{
+//			Key:   "services/gateway/gw-01",
+//			Value: "10.0.0.8:8080",
+//			TTL:   10,
+//		},
+//	)
+//	if err != nil {
+//		return err
+//	}
+//	defer reg.Close()
+//
+//	if err := reg.Register(); err != nil {
+//		return err
+//	}
+//
+// NewRegister 只创建 etcd 客户端；Register 才会同步创建租约、写入 key/value
+// 并启动 keepalive。endpoints 使用逗号分隔。TTL、DialTimeout 和 GrantTimeout
+// 未设置时分别使用 10 秒、5 秒和 5 秒。
+//
+// # 动态注册
+//
+// 地址或实例 ID 可能变化时使用 KeyFunc/ValueFunc：
+//
+//	reg, err := register.NewRegister(endpoint, register.RegisterOption{
+//		KeyFunc: func() string {
+//			return "services/gateway/" + currentInstanceID()
+//		},
+//		ValueFunc: func() string {
+//			return currentAdvertiseAddr()
+//		},
+//		TTL: 10,
+//		OnLeaseLost: func(err error) {
+//			log.Error("registration lost: %v", err)
+//		},
 //	})
-//	if err != nil { ... }
-//	reg.Register()
 //
-// 支持自动重注册（默认开启）和动态 key/value：
+// 函数值优先于静态 Key/Value，并在首次注册和重新注册时重新求值。keepalive
+// 中断后注册器会尝试重新注册；自动恢复失败时调用 OnLeaseLost。
 //
-//	reg := register.NewRegister("127.0.0.1:2379", register.RegisterOption{
-//	    KeyFunc:   func() string { return "service/" + hostname },
-//	    ValueFunc: func() string { return getMyIP() },
-//	    TTL: 10,
-//	})
-//	reg.Register()
+// IsAlive 只表示本地注册器当前认为租约有效，不能代替业务侧的端到端健康检查。
+// LeaseID 可用于诊断。ReRegister 会撤销旧租约并重新执行注册。Close 应在进程
+// 退出时调用，它会取消保活、尽力撤销租约并关闭 etcd 客户端。
 package register
 
 import (
@@ -146,16 +174,24 @@ func NewRegister(endpoints string, opt RegisterOption) (*Register, error) {
 		DialTimeout: opt.DialTimeout,
 	})
 	if err != nil {
+		log.Error("[ETCD-REGISTER] 创建 etcd 客户端失败: endpoints=%s, err=%v", endpoints, err)
 		return nil, fmt.Errorf("etcd client error: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Register{
+	reg := &Register{
 		client: cli,
 		opt:    opt,
 		ctx:    ctx,
 		cancel: cancel,
-	}, nil
+	}
+	log.Info(
+		"[ETCD-REGISTER] 注册器创建成功: endpoints=%s, key=%s, ttl=%ds",
+		endpoints,
+		opt.getKey(),
+		opt.TTL,
+	)
+	return reg, nil
 }
 
 // Register 执行首次注册。
@@ -163,7 +199,11 @@ func NewRegister(endpoints string, opt RegisterOption) (*Register, error) {
 func (r *Register) Register() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.doRegister()
+	if err := r.doRegister(); err != nil {
+		log.Error("[ETCD-REGISTER] 服务注册失败: key=%s, err=%v", r.opt.getKey(), err)
+		return err
+	}
+	return nil
 }
 
 // doRegister 内部注册逻辑（无锁）
@@ -255,7 +295,11 @@ func (r *Register) ReRegister() error {
 		}
 	}
 
-	return r.doRegister()
+	if err := r.doRegister(); err != nil {
+		log.Error("[ETCD-REGISTER] 服务重新注册失败: key=%s, err=%v", r.opt.getKey(), err)
+		return err
+	}
+	return nil
 }
 
 // IsAlive 返回当前注册是否有效。
@@ -289,5 +333,10 @@ func (r *Register) Close() error {
 		r.registered = false
 	}
 
-	return r.client.Close()
+	if err := r.client.Close(); err != nil {
+		log.Error("[ETCD-REGISTER] 关闭 etcd 客户端失败: key=%s, err=%v", r.opt.getKey(), err)
+		return err
+	}
+	log.Info("[ETCD-REGISTER] 服务注销完成: key=%s", r.opt.getKey())
+	return nil
 }

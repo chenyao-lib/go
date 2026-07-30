@@ -1,4 +1,51 @@
-// 节点发现核心：etcd 连接管理、节点加载与监听
+// Package watcher 从 etcd 前缀加载并持续监听服务节点，并通过轮询、一致性哈希
+// 或调用方自定义的 SelectStrategy 选择节点。
+//
+// # 创建独立 Watcher
+//
+//	nodes, err := watcher.NewWatcher(
+//		"127.0.0.1:2379",
+//		"services/game/",
+//		10,
+//		watcher.WithHashRing(150),
+//	)
+//	if err != nil {
+//		return err
+//	}
+//	if err := nodes.Start(); err != nil {
+//		return err
+//	}
+//	defer nodes.Close()
+//
+//	addr := nodes.GetNode(playerID)
+//	if addr == "" {
+//		return errors.New("no available game server")
+//	}
+//
+// NewWatcher 默认使用轮询；WithRoundRobin 可显式选择轮询，WithHashRing 的参数
+// 是每个真实节点的虚拟节点数，WithStrategy 可安装自定义并发安全策略。Start
+// 会先建立 etcd 保活上下文、加载已有节点，再启动后台 watch。必须在成功 Start
+// 后调用 GetNode，并在退出时 Close。
+//
+// # etcd 数据格式
+//
+// prefix 下每个 value 支持三种格式：
+//
+//	{"ip":"10.0.0.8","port":8080,"buildNo":"1.0.0"}
+//	{"addr":"10.0.0.8:8080","weight":100}
+//	10.0.0.8:8080
+//
+// 删除事件会从 key 中按 prefix 提取地址，因此注册端应保持 key 与 value 的地址
+// 含义一致，例如 services/game/10.0.0.8:8080。Nodes 返回当前节点快照。
+//
+// 轮询策略忽略 GetNode 的 key；一致性哈希策略使用 key 保持同一业务标识尽量
+// 落在同一节点。没有节点时两种策略都返回空字符串。
+//
+// # 默认实例
+//
+// 简单程序可调用 Init 创建包级 Default，然后用 watcher.GetNode。Init 支持
+// HashRing 和 RoundRobin。需要多个前缀、不同策略或明确管理生命周期时，应使用
+// NewWatcher；使用 Default 的程序退出时也应调用 watcher.Default.Close()。
 package watcher
 
 import (
@@ -73,6 +120,7 @@ func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOptio
 		DialTimeout: 5 * time.Second,
 	})
 	if err != nil {
+		log.Error("[WATCHER] 创建 etcd 客户端失败: endpoints=%s, prefix=%s, err=%v", endpoints, prefix, err)
 		return nil, errors.New("etcd client error: " + err.Error())
 	}
 
@@ -99,6 +147,7 @@ func (nw *NodeWatcher) Start() error {
 	// 1. 创建租约保活
 	ctx, cancel, err := createEtcdLease(nw.cli, nw.leaseTTL)
 	if err != nil {
+		log.Error("[WATCHER] 创建保活租约失败: prefix=%s, ttl=%ds, err=%v", nw.prefix, nw.leaseTTL, err)
 		nw.cli.Close()
 		return err
 	}
@@ -109,12 +158,15 @@ func (nw *NodeWatcher) Start() error {
 	getCtx, getCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer getCancel()
 	if err := nw.loadNodes(getCtx); err != nil {
+		log.Error("[WATCHER] 初始节点加载失败: prefix=%s, err=%v", nw.prefix, err)
+		nw.cancel()
 		nw.cli.Close()
 		return err
 	}
 
 	// 3. 启动 watcher
 	go nw.watchNodes()
+	log.Info("[WATCHER] 节点发现启动成功: prefix=%s, strategy=%T, nodes=%d", nw.prefix, nw.strategy, len(nw.Nodes()))
 	return nil
 }
 
@@ -122,10 +174,16 @@ func (nw *NodeWatcher) Start() error {
 func (nw *NodeWatcher) Close() error {
 	var err error
 	nw.closeOnce.Do(func() {
+		log.Info("[WATCHER] 正在关闭节点发现: prefix=%s", nw.prefix)
 		if nw.cancel != nil {
 			nw.cancel()
 		}
 		err = nw.cli.Close()
+		if err != nil {
+			log.Error("[WATCHER] 关闭节点发现失败: prefix=%s, err=%v", nw.prefix, err)
+		} else {
+			log.Info("[WATCHER] 节点发现已关闭: prefix=%s", nw.prefix)
+		}
 	})
 	return err
 }
@@ -201,7 +259,11 @@ func (nw *NodeWatcher) watchNodes() {
 			}
 		}
 	}
-	log.Warn("[WATCHER] watchNodes exited")
+	if nw.ctx != nil && nw.ctx.Err() != nil {
+		log.Info("[WATCHER] 节点监听正常退出: prefix=%s", nw.prefix)
+	} else {
+		log.Warn("[WATCHER] 节点监听意外退出: prefix=%s", nw.prefix)
+	}
 }
 
 // createEtcdLease 创建租约并持续 keepalive，返回可取消的 context

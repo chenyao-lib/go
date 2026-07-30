@@ -1,3 +1,61 @@
+// Package clt 实现带认证、自动重连、请求响应关联和服务端推送处理的
+// WebSocket RPC 客户端。
+//
+// # 建立连接
+//
+//	func run(ctx context.Context) {
+//		client := clt.NewClient(ctx, "127.0.0.1:8080", "worker", "worker-01")
+//		client.SetDefaultCallTimeout(5 * time.Second)
+//		client.SetCallTimeout("job.run", 30*time.Second)
+//		client.SetHandlerQueueSize(512)
+//
+//		client.RegisterHandler("job.cancel", func(
+//			c *clt.WSClient,
+//			data json.RawMessage,
+//		) (any, error) {
+//			var req CancelRequest
+//			if err := json.Unmarshal(data, &req); err != nil {
+//				return nil, err
+//			}
+//			return CancelResponse{OK: true}, nil
+//		})
+//
+//		go client.Start(func(c *clt.WSClient) {
+//			log.Info("connected: %s", c.Addr)
+//		})
+//		defer client.Close()
+//	}
+//
+// host 不含协议时会自动组成 ws://host/ws；传入完整 ws:// 或 wss:// 地址时
+// 原样使用。Start 会持续运行并在断线后指数退避重连，直到父 context 取消或
+// Close 被调用，因此通常放在独立 goroutine 中。Close 会永久停止该实例，
+// 关闭后不能重新 Start。
+//
+// # 调用与推送
+//
+// Call 发送带 Session 的同步 RPC，并返回 json.RawMessage：
+//
+//	raw, err := client.Call("job.run", RunRequest{ID: "42"})
+//
+// 已知响应类型时可使用 CallT：
+//
+//	result, raw, _, err := clt.CallT[RunResponse](
+//		client, "job.run", RunRequest{ID: "42"},
+//	)
+//
+// Send 发送不等待响应的消息。RegisterHandler 用于处理服务端主动发送的调用；
+// 应在 Start 前注册。Call/Send 只应在 IsConnected 或 IsReady 为 true 时使用。
+//
+// # 认证和载荷加密
+//
+// 默认认证载荷包含 NewClient 传入的 clientType 和 clientId。需要附加认证字段时
+// 在 Start 前调用 SetAuthPayload。调用 SetPayloadCodec 可加密 RPC 的 Data
+// 字段；它只能在未连接状态设置，并且必须与服务端认证返回的 Codec 使用相同
+// 密钥和 key ID。
+//
+// 读超时、控制帧写超时、默认调用超时、单方法调用超时和处理队列容量都应在
+// Start 前配置。WaitStopSignal 是命令行程序等待 SIGINT/SIGTERM 并清理客户端
+// 的便捷入口。
 package clt
 
 import (
@@ -432,6 +490,7 @@ func NewClient(ctx context.Context, host string, clientType string, clientId str
 	c.readDeadline.Store(int64(30 * time.Second))
 	c.controlWriteTimeout.Store(int64(2 * time.Second))
 	c.authPayload = defaultAuthPayload
+	log.Info("[CLT] 客户端创建完成: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
 	return c
 }
 
@@ -440,11 +499,13 @@ func (c *WSClient) Close() {
 	if !c.closed.CompareAndSwap(false, true) {
 		return
 	}
+	log.Info("[CLT] 正在关闭客户端: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
 	c.Cancel()
 	c.mu.RLock()
 	done := c.connDone
 	c.mu.RUnlock()
 	c.waitDoneWithTimeout(done, 5*time.Second, "close: wait goroutine exit timeout")
+	log.Info("[CLT] 客户端已关闭: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
 }
 
 // IsReady 返回当前底层连接是否就绪（已连接且未主动关闭）
@@ -478,6 +539,9 @@ func (c *WSClient) cleanPendingWithError(errMsg string) {
 }
 
 func (c *WSClient) Start(onConnected func(*WSClient)) {
+	log.Info("[CLT] 客户端运行循环启动: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
+	defer log.Info("[CLT] 客户端运行循环退出: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
+
 	const (
 		minBackoff = 1 * time.Second
 		maxBackoff = 60 * time.Second
@@ -717,11 +781,13 @@ func (c *WSClient) SetHandlerQueueSize(n int) {
 
 func (c *WSClient) SetAuthPayload(fn AuthPayloadFunc) {
 	if fn == nil {
+		log.Warn("[CLT] 忽略空的认证载荷函数: client=%s", c.ClientId)
 		return
 	}
 	c.mu.Lock()
 	c.authPayload = fn
 	c.mu.Unlock()
+	log.Info("[CLT] 已配置自定义认证载荷: client=%s", c.ClientId)
 }
 
 func (c *WSClient) buildAuthData() ([]byte, error) {
@@ -838,6 +904,7 @@ func (c *WSClient) RegisterHandler(method string, handler func(clt *WSClient, da
 	c.handlersMu.Lock()
 	defer c.handlersMu.Unlock()
 	c.handlers[method] = handler
+	log.Info("[CLT] 已注册客户端处理器: client=%s, method=%s", c.ClientId, method)
 }
 
 func CallT[T any](c *WSClient, method string, arg any) (*T, json.RawMessage, *WSClient, error) {

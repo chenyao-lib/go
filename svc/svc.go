@@ -1,3 +1,61 @@
+// Package svc 提供进程内、按名称注册的串行消息服务。每个 Service 拥有独立队列，
+// 支持同步调用、异步发送、处理超时、调用超时、优雅停止和指标快照。
+//
+// # 定义和启动服务
+//
+//	type EchoDefinition struct{}
+//
+//	func (EchoDefinition) Name() string { return "echo" }
+//	func (EchoDefinition) Init(ctx context.Context) error { return nil }
+//	func (EchoDefinition) Handlers() map[string]svc.Handler {
+//		return map[string]svc.Handler{
+//			"upper": func(ctx context.Context, args any) (any, error) {
+//				text, ok := args.(string)
+//				if !ok {
+//					return nil, errors.New("args must be string")
+//				}
+//				return strings.ToUpper(text), nil
+//			},
+//		}
+//	}
+//
+//	echo := svc.NewService(EchoDefinition{})
+//	if err := echo.Start(); err != nil {
+//		return err
+//	}
+//	defer echo.Stop()
+//
+// 同一进程内运行中的服务名称必须唯一。Start 会注册服务并启动队列，Stop 会先
+// 从注册表移除服务，再在 DrainTimeout 内尽量处理剩余消息。Definition 还可实现
+// ConfigProvider、DefaultHandlerTimeoutProvider、ServiceMethodTimeoutProvider
+// 或 ServiceCallTimeoutProvider 提供配置。
+//
+// # 调用规则
+//
+// 外部 goroutine 直接进入某个服务时使用 RawCall 或 RawSend：
+//
+//	result, err := echo.RawCall(ctx, "upper", "hello")
+//
+// 在 Handler 内调用其他已注册服务时，使用当前 Service 的 Call 或 Send：
+//
+//	result, err := current.Call(ctx, "echo", "upper", "hello")
+//
+// RawCall/RawSend 不允许从 Service Handler 内调用；这样可以避免绕过执行令牌。
+// Call 在等待目标服务时会临时释放当前服务的执行令牌，返回后再恢复，避免服务间
+// 同步调用把当前队列永久阻塞。调用方仍应避免形成循环等待。
+//
+// RawCall、Call、RawSend 和 Send 都可能返回队列满、服务停止或超时错误；应使用
+// errors.Is 判断 ErrQueueFull、ErrCallTimeout 等预定义错误。
+//
+// # 配置、日志和指标
+//
+// 队列大小等结构性配置应在 Start 前通过 Definition 的 ConfigProvider 或
+// SetConfig 设置。SetHandlerTimeout/SetMethodTimeouts 控制处理时限，
+// SetDefaultCallTimeout/SetCallTimeouts 控制等待响应的时限。
+//
+// Info、Warn、Error、Debug 会自动在日志正文前添加 serviceName|，并保留
+// printf 风格的 go vet/gopls 参数检查。Snapshot 返回队列占用、调用超时、
+// 处理超时、发送失败和 panic 等累计指标。
 package svc
 
 import (
@@ -289,12 +347,16 @@ func GetService(name string) (*Service, bool) {
 
 func (s *Service) Start() error {
 	if !s.state.CompareAndSwap(int32(StateStopped), int32(StateRunning)) {
-		return fmt.Errorf("service %s already started", s.name)
+		err := fmt.Errorf("service %s already started", s.name)
+		s.Warn("start rejected: %v", err)
+		return err
 	}
 
 	if err := globalReg.register(s.name, s); err != nil {
 		s.state.Store(int32(StateStopped))
-		return fmt.Errorf("register %s: %w", s.name, err)
+		wrapped := fmt.Errorf("register %s: %w", s.name, err)
+		s.Error("register failed: %v", wrapped)
+		return wrapped
 	}
 
 	s.wg.Add(1)

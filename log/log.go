@@ -1,3 +1,44 @@
+// Package log 提供进程级日志输出、按天/大小滚动文件、控制台输出和运行时级别控制。
+//
+// # 基本用法
+//
+// 程序启动时初始化一次，并在退出前关闭文件：
+//
+//	func main() {
+//		log.Init("gateway", "./logs", 100*1024*1024, log.LevelInfo)
+//		defer log.Close()
+//
+//		if err := log.SetTimezone("Asia/Shanghai"); err != nil {
+//			panic(err)
+//		}
+//		log.Info("server started at %s", ":8080")
+//	}
+//
+// Init 的 prefix 是日志文件名前缀，dir 为空时使用 logs，maxSize 小于等于
+// 0 时使用 100 MiB。日志文件按日期命名；同一天超过 maxSize 后依次生成带
+// _1、_2 等后缀的备份文件。SetConsole 可单独关闭控制台输出，SetLevel 可在
+// 运行时调整最低输出级别。
+//
+// # 格式化与静态检查
+//
+// Debug、Info、Warn、Error 和 Write 都使用 fmt.Printf 风格的格式串：
+//
+//	log.Info("user=%s retries=%d", userID, retries)
+//
+// 格式串应尽量使用字符串常量。go vet 和 gopls 能检查格式符对应的参数数量
+// 与类型。Error 除正文外还会附加调用栈。
+//
+// # 直接写入
+//
+// 通常应使用四个级别函数。需要自定义级别标签或正文排版时可调用 Write：
+//
+//	log.Write(log.LevelInfo, "INFO", false, "worker| task=%s", taskID)
+//
+// leadingSpace 为 true 时，在调用位置与正文之间补一个空格；为 false 时正文
+// 紧跟调用位置信息。Write 是公开 API，修改其参数时需要同步更新直接调用方。
+//
+// 包使用全局单例，所有配置和写入均可并发调用，但应用通常只应在启动阶段调用
+// Init、SetTimezone 和 SetConsole。
 package log
 
 import (

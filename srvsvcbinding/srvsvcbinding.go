@@ -1,3 +1,47 @@
+// Package srvsvcbinding 把每个 srv.Client 连接绑定到一个独立的 svc.Instance，
+// 并统一管理连接建立、消息分发、服务停止和中间件回滚。
+//
+// # 创建绑定
+//
+//	server := srv.NewServer(":8080")
+//
+//	binding := srvsvcbinding.NewClientServiceBinding(
+//		server,
+//		func(client *srv.Client) svc.Instance {
+//			definition := NewConnectionDefinition(client)
+//			return svc.NewService(definition)
+//		},
+//		srvsvcbinding.WithMiddleware(authzMiddleware),
+//	)
+//	_ = binding
+//
+//	_ = server.Start()
+//
+// 工厂应为每个连接返回新的 Service 实例，并确保 Name 在进程内唯一，例如包含
+// client.ID。连接 ready 后 binding 按顺序执行中间件、创建并启动 Service；
+// 连接关闭时先停止 Service，再按逆序执行已成功 ready 的中间件。
+//
+// NewClientServiceBinding 会接管 WsServer 的 OnClientReady、OnClientClose 和
+// DefaultHandler。创建 binding 后不要再调用对应 setter 覆盖它们；需要额外
+// 生命周期逻辑时应使用 Middleware。
+//
+// # 消息分发
+//
+// 带 Session 的客户端消息通过 Instance.RawCall 分发，Handler 返回值会作为 RPC
+// 响应发回客户端；Session 为空的消息通过 Instance.RawSend 分发，不等待业务
+// 返回值。客户端 method 必须与该连接 Service 的 Handler 名称一致。
+//
+// # 中间件
+//
+// Middleware 的执行顺序为：
+//
+//	OnClientReady:  m1 -> m2 -> Service.Start
+//	BeforeMessage:  m1 -> m2 -> Service
+//	OnClientClose:  Service.Stop -> m2 -> m1
+//
+// 任一 OnClientReady 失败会拒绝连接，并只回滚此前已成功的中间件。任一
+// BeforeMessage 失败会终止本条消息的分发，但不会自动关闭连接。只需实现部分
+// 生命周期时可使用 MiddlewareFuncs，未设置的函数会作为成功的空操作。
 package srvsvcbinding
 
 import (
@@ -100,6 +144,7 @@ func NewClientServiceBinding(
 	ws.SetOnClientReady(b.onClientReady)
 	ws.SetOnClientClose(b.onClientClose)
 	ws.RegisterDefaultHandler(b.handleMessage)
+	log.Info("[SRVSVCBINDING] 连接服务绑定已创建: middlewares=%d", len(b.middlewares))
 	return b
 }
 
@@ -112,7 +157,12 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 
 	for _, middleware := range b.middlewares {
 		if err := middleware.OnClientReady(ctx, c); err != nil {
-			log.Error("connection middleware ready failed: %v", err)
+			log.Error(
+				"[SRVSVCBINDING] 连接中间件初始化失败: client_type=%s, client_id=%s, err=%v",
+				c.Type,
+				c.ID,
+				err,
+			)
 			b.states.Delete(c)
 			b.stopConnection(ctx, state, c)
 			c.CloseWithReason(1011, "prepare connection failed")
@@ -123,27 +173,44 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 
 	connSvc := b.svcFactory(c)
 	if connSvc == nil {
-		log.Error("create connection service failed: factory returned nil")
+		log.Error(
+			"[SRVSVCBINDING] 连接服务创建失败，工厂返回 nil: client_type=%s, client_id=%s",
+			c.Type,
+			c.ID,
+		)
 		b.states.Delete(c)
 		b.stopConnection(ctx, state, c)
 		c.CloseWithReason(1011, "create connection service failed")
 		return
 	}
 	if err := connSvc.Start(); err != nil {
-		log.Error("start connection service failed: %v", err)
+		log.Error(
+			"[SRVSVCBINDING] 连接服务启动失败: client_type=%s, client_id=%s, service=%s, err=%v",
+			c.Type,
+			c.ID,
+			connSvc.Name(),
+			err,
+		)
 		b.states.Delete(c)
 		b.stopConnection(ctx, state, c)
 		c.CloseWithReason(1011, "start connection service failed")
 		return
 	}
 	state.service = connSvc
-	log.Info("connection service started: %s", connSvc.Name())
+	log.Info(
+		"[SRVSVCBINDING] 连接服务启动成功: client_type=%s, client_id=%s, service=%s",
+		c.Type,
+		c.ID,
+		connSvc.Name(),
+	)
 }
 
 // onClientClose 保证连接状态只取出一次，避免重复 close 导致重复清理。
 func (b *ClientServiceBinding) onClientClose(c *srv.Client) {
 	if value, ok := b.states.LoadAndDelete(c); ok {
 		b.stopConnection(context.Background(), value.(*connectionState), c)
+	} else {
+		log.Debug("[SRVSVCBINDING] 连接关闭时未找到绑定状态: client_type=%s, client_id=%s", c.Type, c.ID)
 	}
 }
 
@@ -152,16 +219,40 @@ func (b *ClientServiceBinding) onClientClose(c *srv.Client) {
 func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) (any, error) {
 	value, ok := b.states.Load(c)
 	if !ok {
-		return nil, errors.New("connection service not found")
+		err := errors.New("connection service not found")
+		log.Warn(
+			"[SRVSVCBINDING] 消息分发失败，连接服务不存在: client_type=%s, client_id=%s, method=%s, session=%s",
+			c.Type,
+			c.ID,
+			msg.Method,
+			msg.Session,
+		)
+		return nil, err
 	}
 	state := value.(*connectionState)
 	if state.service == nil {
-		return nil, errors.New("connection service is not ready")
+		err := errors.New("connection service is not ready")
+		log.Warn(
+			"[SRVSVCBINDING] 消息分发失败，连接服务未就绪: client_type=%s, client_id=%s, method=%s, session=%s",
+			c.Type,
+			c.ID,
+			msg.Method,
+			msg.Session,
+		)
+		return nil, err
 	}
 
 	ctx := context.Background()
 	for _, middleware := range state.readyMiddlewares {
 		if err := middleware.BeforeMessage(ctx, c, msg); err != nil {
+			log.Warn(
+				"[SRVSVCBINDING] 消息被中间件拒绝: client_type=%s, client_id=%s, method=%s, session=%s, err=%v",
+				c.Type,
+				c.ID,
+				msg.Method,
+				msg.Session,
+				err,
+			)
 			return nil, err
 		}
 	}
@@ -177,7 +268,12 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 func (b *ClientServiceBinding) stopConnection(ctx context.Context, state *connectionState, c *srv.Client) {
 	if state.service != nil {
 		state.service.Stop()
-		log.Info("connection service stopped: %s", state.service.Name())
+		log.Info(
+			"[SRVSVCBINDING] 连接服务已停止: client_type=%s, client_id=%s, service=%s",
+			c.Type,
+			c.ID,
+			state.service.Name(),
+		)
 	}
 	for idx := len(state.readyMiddlewares) - 1; idx >= 0; idx-- {
 		state.readyMiddlewares[idx].OnClientClose(ctx, c)
