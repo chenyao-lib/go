@@ -14,11 +14,11 @@ func (c *WSClient) SetPayloadCodec(codec payloadcodec.Codec) error {
 	defer c.mu.Unlock()
 	if c.isReady {
 		err := errors.New("payload codec cannot be changed while connected")
-		log.Warn("[CLT] 连接已就绪，拒绝修改 payload codec: client=%s, codec=%T", c.ClientId, codec)
+		log.Warn("连接已就绪，拒绝修改 payload codec: client=%s, codec=%T", c.ClientId, codec)
 		return err
 	}
 	c.codec = codec
-	log.Info("[CLT] payload codec 配置完成: client=%s, codec=%T", c.ClientId, codec)
+	log.Info("payload codec 配置完成: client=%s, codec=%T", c.ClientId, codec)
 	return nil
 }
 

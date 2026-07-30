@@ -490,7 +490,7 @@ func NewClient(ctx context.Context, host string, clientType string, clientId str
 	c.readDeadline.Store(int64(30 * time.Second))
 	c.controlWriteTimeout.Store(int64(2 * time.Second))
 	c.authPayload = defaultAuthPayload
-	log.Info("[CLT] 客户端创建完成: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
+	log.Info("客户端创建完成: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
 	return c
 }
 
@@ -499,13 +499,13 @@ func (c *WSClient) Close() {
 	if !c.closed.CompareAndSwap(false, true) {
 		return
 	}
-	log.Info("[CLT] 正在关闭客户端: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
+	log.Info("正在关闭客户端: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
 	c.Cancel()
 	c.mu.RLock()
 	done := c.connDone
 	c.mu.RUnlock()
 	c.waitDoneWithTimeout(done, 5*time.Second, "close: wait goroutine exit timeout")
-	log.Info("[CLT] 客户端已关闭: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
+	log.Info("客户端已关闭: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
 }
 
 // IsReady 返回当前底层连接是否就绪（已连接且未主动关闭）
@@ -539,8 +539,8 @@ func (c *WSClient) cleanPendingWithError(errMsg string) {
 }
 
 func (c *WSClient) Start(onConnected func(*WSClient)) {
-	log.Info("[CLT] 客户端运行循环启动: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
-	defer log.Info("[CLT] 客户端运行循环退出: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
+	log.Info("客户端运行循环启动: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
+	defer log.Info("客户端运行循环退出: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
 
 	const (
 		minBackoff = 1 * time.Second
@@ -781,13 +781,13 @@ func (c *WSClient) SetHandlerQueueSize(n int) {
 
 func (c *WSClient) SetAuthPayload(fn AuthPayloadFunc) {
 	if fn == nil {
-		log.Warn("[CLT] 忽略空的认证载荷函数: client=%s", c.ClientId)
+		log.Warn("忽略空的认证载荷函数: client=%s", c.ClientId)
 		return
 	}
 	c.mu.Lock()
 	c.authPayload = fn
 	c.mu.Unlock()
-	log.Info("[CLT] 已配置自定义认证载荷: client=%s", c.ClientId)
+	log.Info("已配置自定义认证载荷: client=%s", c.ClientId)
 }
 
 func (c *WSClient) buildAuthData() ([]byte, error) {
@@ -904,7 +904,7 @@ func (c *WSClient) RegisterHandler(method string, handler func(clt *WSClient, da
 	c.handlersMu.Lock()
 	defer c.handlersMu.Unlock()
 	c.handlers[method] = handler
-	log.Info("[CLT] 已注册客户端处理器: client=%s, method=%s", c.ClientId, method)
+	log.Info("已注册客户端处理器: client=%s, method=%s", c.ClientId, method)
 }
 
 func CallT[T any](c *WSClient, method string, arg any) (*T, json.RawMessage, *WSClient, error) {

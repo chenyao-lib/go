@@ -144,7 +144,7 @@ func NewClientServiceBinding(
 	ws.SetOnClientReady(b.onClientReady)
 	ws.SetOnClientClose(b.onClientClose)
 	ws.RegisterDefaultHandler(b.handleMessage)
-	log.Info("[SRVSVCBINDING] 连接服务绑定已创建: middlewares=%d", len(b.middlewares))
+	log.Info("连接服务绑定已创建: middlewares=%d", len(b.middlewares))
 	return b
 }
 
@@ -158,7 +158,7 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 	for _, middleware := range b.middlewares {
 		if err := middleware.OnClientReady(ctx, c); err != nil {
 			log.Error(
-				"[SRVSVCBINDING] 连接中间件初始化失败: client_type=%s, client_id=%s, err=%v",
+				"连接中间件初始化失败: client_type=%s, client_id=%s, err=%v",
 				c.Type,
 				c.ID,
 				err,
@@ -174,7 +174,7 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 	connSvc := b.svcFactory(c)
 	if connSvc == nil {
 		log.Error(
-			"[SRVSVCBINDING] 连接服务创建失败，工厂返回 nil: client_type=%s, client_id=%s",
+			"连接服务创建失败，工厂返回 nil: client_type=%s, client_id=%s",
 			c.Type,
 			c.ID,
 		)
@@ -185,7 +185,7 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 	}
 	if err := connSvc.Start(); err != nil {
 		log.Error(
-			"[SRVSVCBINDING] 连接服务启动失败: client_type=%s, client_id=%s, service=%s, err=%v",
+			"连接服务启动失败: client_type=%s, client_id=%s, service=%s, err=%v",
 			c.Type,
 			c.ID,
 			connSvc.Name(),
@@ -198,7 +198,7 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 	}
 	state.service = connSvc
 	log.Info(
-		"[SRVSVCBINDING] 连接服务启动成功: client_type=%s, client_id=%s, service=%s",
+		"连接服务启动成功: client_type=%s, client_id=%s, service=%s",
 		c.Type,
 		c.ID,
 		connSvc.Name(),
@@ -210,7 +210,7 @@ func (b *ClientServiceBinding) onClientClose(c *srv.Client) {
 	if value, ok := b.states.LoadAndDelete(c); ok {
 		b.stopConnection(context.Background(), value.(*connectionState), c)
 	} else {
-		log.Debug("[SRVSVCBINDING] 连接关闭时未找到绑定状态: client_type=%s, client_id=%s", c.Type, c.ID)
+		log.Debug("连接关闭时未找到绑定状态: client_type=%s, client_id=%s", c.Type, c.ID)
 	}
 }
 
@@ -221,7 +221,7 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 	if !ok {
 		err := errors.New("connection service not found")
 		log.Warn(
-			"[SRVSVCBINDING] 消息分发失败，连接服务不存在: client_type=%s, client_id=%s, method=%s, session=%s",
+			"消息分发失败，连接服务不存在: client_type=%s, client_id=%s, method=%s, session=%s",
 			c.Type,
 			c.ID,
 			msg.Method,
@@ -233,7 +233,7 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 	if state.service == nil {
 		err := errors.New("connection service is not ready")
 		log.Warn(
-			"[SRVSVCBINDING] 消息分发失败，连接服务未就绪: client_type=%s, client_id=%s, method=%s, session=%s",
+			"消息分发失败，连接服务未就绪: client_type=%s, client_id=%s, method=%s, session=%s",
 			c.Type,
 			c.ID,
 			msg.Method,
@@ -246,7 +246,7 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 	for _, middleware := range state.readyMiddlewares {
 		if err := middleware.BeforeMessage(ctx, c, msg); err != nil {
 			log.Warn(
-				"[SRVSVCBINDING] 消息被中间件拒绝: client_type=%s, client_id=%s, method=%s, session=%s, err=%v",
+				"消息被中间件拒绝: client_type=%s, client_id=%s, method=%s, session=%s, err=%v",
 				c.Type,
 				c.ID,
 				msg.Method,
@@ -269,7 +269,7 @@ func (b *ClientServiceBinding) stopConnection(ctx context.Context, state *connec
 	if state.service != nil {
 		state.service.Stop()
 		log.Info(
-			"[SRVSVCBINDING] 连接服务已停止: client_type=%s, client_id=%s, service=%s",
+			"连接服务已停止: client_type=%s, client_id=%s, service=%s",
 			c.Type,
 			c.ID,
 			state.service.Name(),

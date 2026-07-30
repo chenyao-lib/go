@@ -581,19 +581,19 @@ func (s *WsServer) Start() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Info("[SRV] WebSocket 服务启动: addr=%s, path=/ws", s.WsPort)
+	log.Info("WebSocket 服务启动: addr=%s, path=/ws", s.WsPort)
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Error("[SRV] WebSocket 服务异常退出: addr=%s, err=%v", s.WsPort, err)
+		log.Error("WebSocket 服务异常退出: addr=%s, err=%v", s.WsPort, err)
 		return err
 	}
-	log.Info("[SRV] WebSocket 服务已停止: addr=%s", s.WsPort)
+	log.Info("WebSocket 服务已停止: addr=%s", s.WsPort)
 	return nil
 }
 
 // Shutdown 优雅关闭服务
 func (s *WsServer) Shutdown(ctx context.Context) error {
 	if s.httpServer == nil {
-		log.Debug("[SRV] 服务尚未启动，无需关闭: addr=%s", s.WsPort)
+		log.Debug("服务尚未启动，无需关闭: addr=%s", s.WsPort)
 		return nil
 	}
 	log.Info("开始优雅关闭 WebSocket 服务器...")

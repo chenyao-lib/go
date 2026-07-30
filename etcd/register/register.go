@@ -174,7 +174,7 @@ func NewRegister(endpoints string, opt RegisterOption) (*Register, error) {
 		DialTimeout: opt.DialTimeout,
 	})
 	if err != nil {
-		log.Error("[ETCD-REGISTER] 创建 etcd 客户端失败: endpoints=%s, err=%v", endpoints, err)
+		log.Error("创建 etcd 客户端失败: endpoints=%s, err=%v", endpoints, err)
 		return nil, fmt.Errorf("etcd client error: %w", err)
 	}
 
@@ -186,7 +186,7 @@ func NewRegister(endpoints string, opt RegisterOption) (*Register, error) {
 		cancel: cancel,
 	}
 	log.Info(
-		"[ETCD-REGISTER] 注册器创建成功: endpoints=%s, key=%s, ttl=%ds",
+		"注册器创建成功: endpoints=%s, key=%s, ttl=%ds",
 		endpoints,
 		opt.getKey(),
 		opt.TTL,
@@ -200,7 +200,7 @@ func (r *Register) Register() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.doRegister(); err != nil {
-		log.Error("[ETCD-REGISTER] 服务注册失败: key=%s, err=%v", r.opt.getKey(), err)
+		log.Error("服务注册失败: key=%s, err=%v", r.opt.getKey(), err)
 		return err
 	}
 	return nil
@@ -231,7 +231,7 @@ func (r *Register) doRegister() error {
 	}
 
 	r.registered = true
-	log.Info("[ETCD] 服务注册成功: %s = %s (TTL=%ds)", key, value, r.opt.TTL)
+	log.Info("服务注册成功: %s = %s (TTL=%ds)", key, value, r.opt.TTL)
 
 	go r.watchKeepAlive()
 	return nil
@@ -244,7 +244,7 @@ func (r *Register) watchKeepAlive() {
 		select {
 		case _, ok := <-r.keepAliveCh:
 			if !ok {
-				log.Error("[ETCD] keepalive 通道关闭，服务注册可能已失效: %s", r.opt.getKey())
+				log.Error("keepalive 通道关闭，服务注册可能已失效: %s", r.opt.getKey())
 
 				r.mu.Lock()
 				r.registered = false
@@ -253,14 +253,14 @@ func (r *Register) watchKeepAlive() {
 				r.mu.Unlock()
 
 				if autoReReg {
-					log.Info("[ETCD] 正在自动重新注册: %s", r.opt.getKey())
+					log.Info("正在自动重新注册: %s", r.opt.getKey())
 					if err := r.ReRegister(); err != nil {
-						log.Error("[ETCD] 自动重注册失败: %v", err)
+						log.Error("自动重注册失败: %v", err)
 						if onLost != nil {
 							onLost(err)
 						}
 					} else {
-						log.Info("[ETCD] 自动重注册成功: %s", r.opt.getKey())
+						log.Info("自动重注册成功: %s", r.opt.getKey())
 					}
 				} else {
 					if onLost != nil {
@@ -271,7 +271,7 @@ func (r *Register) watchKeepAlive() {
 			}
 
 		case <-r.ctx.Done():
-			log.Info("[ETCD] 保活监听正常退出: %s", r.opt.getKey())
+			log.Info("保活监听正常退出: %s", r.opt.getKey())
 			return
 		}
 	}
@@ -291,12 +291,12 @@ func (r *Register) ReRegister() error {
 	if r.registered && r.leaseID != 0 {
 		_, err := r.client.Revoke(context.Background(), r.leaseID)
 		if err != nil {
-			log.Error("[ETCD] 撤销旧租约失败: %v", err)
+			log.Error("撤销旧租约失败: %v", err)
 		}
 	}
 
 	if err := r.doRegister(); err != nil {
-		log.Error("[ETCD-REGISTER] 服务重新注册失败: key=%s, err=%v", r.opt.getKey(), err)
+		log.Error("服务重新注册失败: key=%s, err=%v", r.opt.getKey(), err)
 		return err
 	}
 	return nil
@@ -321,22 +321,22 @@ func (r *Register) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	log.Info("[ETCD] 正在注销服务: %s", r.opt.getKey())
+	log.Info("正在注销服务: %s", r.opt.getKey())
 
 	r.cancel()
 
 	if r.registered && r.leaseID != 0 {
 		_, err := r.client.Revoke(context.Background(), r.leaseID)
 		if err != nil {
-			log.Error("[ETCD] 撤销租约失败: %v", err)
+			log.Error("撤销租约失败: %v", err)
 		}
 		r.registered = false
 	}
 
 	if err := r.client.Close(); err != nil {
-		log.Error("[ETCD-REGISTER] 关闭 etcd 客户端失败: key=%s, err=%v", r.opt.getKey(), err)
+		log.Error("关闭 etcd 客户端失败: key=%s, err=%v", r.opt.getKey(), err)
 		return err
 	}
-	log.Info("[ETCD-REGISTER] 服务注销完成: key=%s", r.opt.getKey())
+	log.Info("服务注销完成: key=%s", r.opt.getKey())
 	return nil
 }

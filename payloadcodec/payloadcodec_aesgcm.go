@@ -48,17 +48,17 @@ func NewAESGCMCodec(base64Key, keyID string) (*AESGCMCodec, error) {
 	keyText := strings.TrimSpace(base64Key)
 	if keyText == "" {
 		err := errors.New("client payload key is empty")
-		log.Error("[PAYLOADCODEC] AES-GCM 初始化失败: key_id=%s, err=%v", keyID, err)
+		log.Error("AES-GCM 初始化失败: key_id=%s, err=%v", keyID, err)
 		return nil, err
 	}
 
 	key, err := base64.StdEncoding.DecodeString(keyText)
 	if err != nil {
-		log.Error("[PAYLOADCODEC] AES-GCM 密钥解码失败: key_id=%s, err=%v", keyID, err)
+		log.Error("AES-GCM 密钥解码失败: key_id=%s, err=%v", keyID, err)
 		return nil, fmt.Errorf("decode client payload key: %w", err)
 	}
 	if _, err := aes.NewCipher(key); err != nil {
-		log.Error("[PAYLOADCODEC] AES-GCM 密钥无效: key_id=%s, err=%v", keyID, err)
+		log.Error("AES-GCM 密钥无效: key_id=%s, err=%v", keyID, err)
 		return nil, fmt.Errorf("invalid client payload key: %w", err)
 	}
 
@@ -66,7 +66,7 @@ func NewAESGCMCodec(base64Key, keyID string) (*AESGCMCodec, error) {
 		key:   append([]byte(nil), key...),
 		keyID: strings.TrimSpace(keyID),
 	}
-	log.Info("[PAYLOADCODEC] AES-GCM 初始化成功: key_id=%s", codec.keyID)
+	log.Info("AES-GCM 初始化成功: key_id=%s", codec.keyID)
 	return codec, nil
 }
 

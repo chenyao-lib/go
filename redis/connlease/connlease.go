@@ -229,7 +229,7 @@ func Open(ctx context.Context, cfg Config) (*Manager, error) {
 	})
 	if err := client.Ping(ctx).Err(); err != nil {
 		_ = client.Close()
-		log.Error("[CONNLEASE] Redis 连接失败: addr=%s, db=%d, err=%v", cfg.Addr, cfg.DB, err)
+		log.Error("Redis 连接失败: addr=%s, db=%d, err=%v", cfg.Addr, cfg.DB, err)
 		return nil, fmt.Errorf("connect session redis: %w", err)
 	}
 
@@ -249,7 +249,7 @@ func Open(ctx context.Context, cfg Config) (*Manager, error) {
 		cancel()
 		_ = manager.pubsub.Close()
 		_ = client.Close()
-		log.Error("[CONNLEASE] 踢线频道订阅失败: channel=%s, err=%v", manager.kickChannel(), err)
+		log.Error("踢线频道订阅失败: channel=%s, err=%v", manager.kickChannel(), err)
 		return nil, fmt.Errorf("subscribe session kick channel: %w", err)
 	}
 
@@ -257,7 +257,7 @@ func Open(ctx context.Context, cfg Config) (*Manager, error) {
 	go manager.listenKicks()
 	go manager.renewConnections()
 	log.Info(
-		"[CONNLEASE] 管理器启动成功: addr=%s, db=%d, server=%s, prefix=%s, ttl=%s, renew=%s",
+		"管理器启动成功: addr=%s, db=%d, server=%s, prefix=%s, ttl=%s, renew=%s",
 		cfg.Addr,
 		cfg.DB,
 		cfg.ServerAddr,
@@ -294,7 +294,7 @@ func (m *Manager) Register(
 	}
 	previous, epoch, err := m.acquire(ctx, key, connectionID)
 	if err != nil {
-		log.Error("[CONNLEASE] 获取连接所有权失败: key=%s, server=%s, err=%v", key, m.serverAddr, err)
+		log.Error("获取连接所有权失败: key=%s, server=%s, err=%v", key, m.serverAddr, err)
 		return nil, err
 	}
 
@@ -312,7 +312,7 @@ func (m *Manager) Register(
 
 	if previous.connectionID != "" && previous.connectionID != connectionID {
 		log.Warn(
-			"[CONNLEASE] 新连接替换旧连接: key=%s, old_server=%s, old_connection=%s, new_server=%s, new_connection=%s",
+			"新连接替换旧连接: key=%s, old_server=%s, old_connection=%s, new_server=%s, new_connection=%s",
 			key,
 			previous.serverAddr,
 			previous.connectionID,
@@ -321,7 +321,7 @@ func (m *Manager) Register(
 		)
 		if err := m.publishKick(ctx, key, previous.connectionID); err != nil {
 			log.Error(
-				"[CONNLEASE] 发布旧连接踢线消息失败: key=%s, old_server=%s, old_connection=%s, err=%v",
+				"发布旧连接踢线消息失败: key=%s, old_server=%s, old_connection=%s, err=%v",
 				key,
 				previous.serverAddr,
 				previous.connectionID,
@@ -330,7 +330,7 @@ func (m *Manager) Register(
 		}
 	}
 	log.Info(
-		"[CONNLEASE] 已获取连接所有权: key=%s, server=%s, connection=%s, epoch=%d",
+		"已获取连接所有权: key=%s, server=%s, connection=%s, epoch=%d",
 		key,
 		m.serverAddr,
 		connectionID,
@@ -348,7 +348,7 @@ func (m *Manager) Unregister(ctx context.Context, handle *Handle) {
 	entry.active.Store(false)
 	if m.ctx.Err() != nil {
 		log.Debug(
-			"[CONNLEASE] 管理器已关闭，仅移除本地连接: key=%s, connection=%s",
+			"管理器已关闭，仅移除本地连接: key=%s, connection=%s",
 			entry.key,
 			entry.connectionID,
 		)
@@ -364,7 +364,7 @@ func (m *Manager) Unregister(ctx context.Context, handle *Handle) {
 	).Int()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		log.Error(
-			"[CONNLEASE] 释放连接所有权失败: key=%s, connection=%s, err=%v",
+			"释放连接所有权失败: key=%s, connection=%s, err=%v",
 			entry.key,
 			entry.connectionID,
 			err,
@@ -373,13 +373,13 @@ func (m *Manager) Unregister(ctx context.Context, handle *Handle) {
 	}
 	if released == 1 {
 		log.Info(
-			"[CONNLEASE] 已释放连接所有权: key=%s, connection=%s",
+			"已释放连接所有权: key=%s, connection=%s",
 			entry.key,
 			entry.connectionID,
 		)
 	} else {
 		log.Debug(
-			"[CONNLEASE] 跳过所有权释放，连接已不是当前 owner: key=%s, connection=%s",
+			"跳过所有权释放，连接已不是当前 owner: key=%s, connection=%s",
 			entry.key,
 			entry.connectionID,
 		)
@@ -404,14 +404,14 @@ func (m *Manager) Close() error {
 	m.closeOnce.Do(func() {
 		entries := m.connectionSnapshot()
 		log.Info(
-			"[CONNLEASE] 正在关闭管理器: server=%s, active_connections=%d",
+			"正在关闭管理器: server=%s, active_connections=%d",
 			m.serverAddr,
 			len(entries),
 		)
 		m.cancel()
 		if m.pubsub != nil {
 			if err := m.pubsub.Close(); err != nil {
-				log.Warn("[CONNLEASE] 关闭踢线订阅失败: err=%v", err)
+				log.Warn("关闭踢线订阅失败: err=%v", err)
 				closeErr = err
 			}
 		}
@@ -429,7 +429,7 @@ func (m *Manager) Close() error {
 			cancel()
 			if err != nil && !errors.Is(err, redis.Nil) {
 				log.Error(
-					"[CONNLEASE] 关闭时释放连接所有权失败: key=%s, connection=%s, err=%v",
+					"关闭时释放连接所有权失败: key=%s, connection=%s, err=%v",
 					entry.key,
 					entry.connectionID,
 					err,
@@ -440,15 +440,15 @@ func (m *Manager) Close() error {
 			}
 		}
 		if err := m.client.Close(); err != nil {
-			log.Warn("[CONNLEASE] 关闭 Redis 客户端失败: err=%v", err)
+			log.Warn("关闭 Redis 客户端失败: err=%v", err)
 			if closeErr == nil {
 				closeErr = err
 			}
 		}
 		if closeErr != nil {
-			log.Warn("[CONNLEASE] 管理器关闭完成但存在错误: server=%s, err=%v", m.serverAddr, closeErr)
+			log.Warn("管理器关闭完成但存在错误: server=%s, err=%v", m.serverAddr, closeErr)
 		} else {
-			log.Info("[CONNLEASE] 管理器已关闭: server=%s", m.serverAddr)
+			log.Info("管理器已关闭: server=%s", m.serverAddr)
 		}
 	})
 	return closeErr
@@ -505,13 +505,13 @@ func (m *Manager) listenKicks() {
 		case message, ok := <-channel:
 			if !ok {
 				if m.ctx.Err() == nil {
-					log.Warn("[CONNLEASE] 踢线订阅意外关闭: channel=%s", m.kickChannel())
+					log.Warn("踢线订阅意外关闭: channel=%s", m.kickChannel())
 				}
 				return
 			}
 			var kick kickMessage
 			if err := json.Unmarshal([]byte(message.Payload), &kick); err != nil {
-				log.Warn("[CONNLEASE] 解析踢线消息失败: payload=%s, err=%v", message.Payload, err)
+				log.Warn("解析踢线消息失败: payload=%s, err=%v", message.Payload, err)
 				continue
 			}
 			entry := m.connectionByID(kick.ConnectionID)
@@ -562,7 +562,7 @@ func (m *Manager) closeConnection(entry *Handle, reason string, cause error) {
 	entry.closeOnce.Do(func() {
 		if cause != nil {
 			log.Error(
-				"[CONNLEASE] 连接所有权检查失败，关闭连接: key=%s, connection=%s, reason=%s, err=%v",
+				"连接所有权检查失败，关闭连接: key=%s, connection=%s, reason=%s, err=%v",
 				entry.key,
 				entry.connectionID,
 				reason,
@@ -570,7 +570,7 @@ func (m *Manager) closeConnection(entry *Handle, reason string, cause error) {
 			)
 		} else {
 			log.Warn(
-				"[CONNLEASE] 连接所有权已失效，关闭连接: key=%s, connection=%s, reason=%s",
+				"连接所有权已失效，关闭连接: key=%s, connection=%s, reason=%s",
 				entry.key,
 				entry.connectionID,
 				reason,

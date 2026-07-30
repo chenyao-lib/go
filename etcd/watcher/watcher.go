@@ -113,14 +113,14 @@ func WithStrategy(s SelectStrategy) NodeWatcherOption {
 
 // NewWatcher 创建节点发现器
 func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOption) (*NodeWatcher, error) {
-	log.Info("[WATCHER] connecting to etcd: %s", endpoints)
+	log.Info("connecting to etcd: %s", endpoints)
 
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{endpoints},
 		DialTimeout: 5 * time.Second,
 	})
 	if err != nil {
-		log.Error("[WATCHER] 创建 etcd 客户端失败: endpoints=%s, prefix=%s, err=%v", endpoints, prefix, err)
+		log.Error("创建 etcd 客户端失败: endpoints=%s, prefix=%s, err=%v", endpoints, prefix, err)
 		return nil, errors.New("etcd client error: " + err.Error())
 	}
 
@@ -147,7 +147,7 @@ func (nw *NodeWatcher) Start() error {
 	// 1. 创建租约保活
 	ctx, cancel, err := createEtcdLease(nw.cli, nw.leaseTTL)
 	if err != nil {
-		log.Error("[WATCHER] 创建保活租约失败: prefix=%s, ttl=%ds, err=%v", nw.prefix, nw.leaseTTL, err)
+		log.Error("创建保活租约失败: prefix=%s, ttl=%ds, err=%v", nw.prefix, nw.leaseTTL, err)
 		nw.cli.Close()
 		return err
 	}
@@ -158,7 +158,7 @@ func (nw *NodeWatcher) Start() error {
 	getCtx, getCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer getCancel()
 	if err := nw.loadNodes(getCtx); err != nil {
-		log.Error("[WATCHER] 初始节点加载失败: prefix=%s, err=%v", nw.prefix, err)
+		log.Error("初始节点加载失败: prefix=%s, err=%v", nw.prefix, err)
 		nw.cancel()
 		nw.cli.Close()
 		return err
@@ -166,7 +166,7 @@ func (nw *NodeWatcher) Start() error {
 
 	// 3. 启动 watcher
 	go nw.watchNodes()
-	log.Info("[WATCHER] 节点发现启动成功: prefix=%s, strategy=%T, nodes=%d", nw.prefix, nw.strategy, len(nw.Nodes()))
+	log.Info("节点发现启动成功: prefix=%s, strategy=%T, nodes=%d", nw.prefix, nw.strategy, len(nw.Nodes()))
 	return nil
 }
 
@@ -174,15 +174,15 @@ func (nw *NodeWatcher) Start() error {
 func (nw *NodeWatcher) Close() error {
 	var err error
 	nw.closeOnce.Do(func() {
-		log.Info("[WATCHER] 正在关闭节点发现: prefix=%s", nw.prefix)
+		log.Info("正在关闭节点发现: prefix=%s", nw.prefix)
 		if nw.cancel != nil {
 			nw.cancel()
 		}
 		err = nw.cli.Close()
 		if err != nil {
-			log.Error("[WATCHER] 关闭节点发现失败: prefix=%s, err=%v", nw.prefix, err)
+			log.Error("关闭节点发现失败: prefix=%s, err=%v", nw.prefix, err)
 		} else {
-			log.Info("[WATCHER] 节点发现已关闭: prefix=%s", nw.prefix)
+			log.Info("节点发现已关闭: prefix=%s", nw.prefix)
 		}
 	})
 	return err
@@ -234,12 +234,12 @@ func extractAddrFromKey(key, serverPrefix string) string {
 
 // watchNodes 监听 etcd 中 node 的增删变化
 func (nw *NodeWatcher) watchNodes() {
-	log.Info("[WATCHER] etcd watch nodes started, prefix=%s", nw.prefix)
+	log.Info("etcd watch nodes started, prefix=%s", nw.prefix)
 
 	watchChan := nw.cli.Watch(nw.ctx, nw.prefix, clientv3.WithPrefix())
 	for wresp := range watchChan {
 		if wresp.Err() != nil {
-			log.Error("[WATCHER] watch nodes error: %+v", wresp.Err())
+			log.Error("watch nodes error: %+v", wresp.Err())
 			continue
 		}
 		for _, ev := range wresp.Events {
@@ -248,27 +248,27 @@ func (nw *NodeWatcher) watchNodes() {
 				addr := parseNodeAddr(ev.Kv.Value)
 				if addr != "" {
 					nw.strategy.AddNode(addr)
-					log.Info("[WATCHER] Added node: %s", addr)
+					log.Info("Added node: %s", addr)
 				} else {
-					log.Error("[WATCHER] parse node addr failed, key=%s value=%s", string(ev.Kv.Key), string(ev.Kv.Value))
+					log.Error("parse node addr failed, key=%s value=%s", string(ev.Kv.Key), string(ev.Kv.Value))
 				}
 			case clientv3.EventTypeDelete:
 				addr := extractAddrFromKey(string(ev.Kv.Key), nw.prefix)
 				nw.strategy.RemoveNode(addr)
-				log.Info("[WATCHER] Removed node: %s", addr)
+				log.Info("Removed node: %s", addr)
 			}
 		}
 	}
 	if nw.ctx != nil && nw.ctx.Err() != nil {
-		log.Info("[WATCHER] 节点监听正常退出: prefix=%s", nw.prefix)
+		log.Info("节点监听正常退出: prefix=%s", nw.prefix)
 	} else {
-		log.Warn("[WATCHER] 节点监听意外退出: prefix=%s", nw.prefix)
+		log.Warn("节点监听意外退出: prefix=%s", nw.prefix)
 	}
 }
 
 // createEtcdLease 创建租约并持续 keepalive，返回可取消的 context
 func createEtcdLease(cli *clientv3.Client, leaseTTL int) (context.Context, context.CancelFunc, error) {
-	log.Info("[WATCHER] creating etcd lease (TTL %ds)...", leaseTTL)
+	log.Info("creating etcd lease (TTL %ds)...", leaseTTL)
 
 	leaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	lease, err := cli.Grant(leaseCtx, int64(leaseTTL))
@@ -276,7 +276,7 @@ func createEtcdLease(cli *clientv3.Client, leaseTTL int) (context.Context, conte
 	if err != nil {
 		return nil, nil, errors.New("etcd grant lease error: " + err.Error())
 	}
-	log.Info("[WATCHER] etcd lease granted: %d", lease.ID)
+	log.Info("etcd lease granted: %d", lease.ID)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	keepaliveCh, err := cli.KeepAlive(ctx, lease.ID)
@@ -289,7 +289,7 @@ func createEtcdLease(cli *clientv3.Client, leaseTTL int) (context.Context, conte
 		// 消费 keepalive 通道防止阻塞，etcd client 内部自动续约
 		for range keepaliveCh {
 		}
-		log.Error("[WATCHER] etcd keepalive stopped")
+		log.Error("etcd keepalive stopped")
 		cancel()
 	}()
 
@@ -298,7 +298,7 @@ func createEtcdLease(cli *clientv3.Client, leaseTTL int) (context.Context, conte
 
 // loadNodes 从 etcd 加载已有 node 并写入策略
 func (nw *NodeWatcher) loadNodes(ctx context.Context) error {
-	log.Info("[WATCHER] loading existing nodes from etcd...")
+	log.Info("loading existing nodes from etcd...")
 
 	resp, err := nw.cli.Get(ctx, nw.prefix, clientv3.WithPrefix())
 	if err != nil {
@@ -309,12 +309,12 @@ func (nw *NodeWatcher) loadNodes(ctx context.Context) error {
 		addr := parseNodeAddr(kv.Value)
 		if addr != "" {
 			nw.strategy.AddNode(addr)
-			log.Info("[WATCHER] Loaded node: %s", addr)
+			log.Info("Loaded node: %s", addr)
 		} else {
-			log.Error("[WATCHER] parse node addr failed, key=%s value=%s", string(kv.Key), string(kv.Value))
+			log.Error("parse node addr failed, key=%s value=%s", string(kv.Key), string(kv.Value))
 		}
 	}
-	log.Info("[WATCHER] loaded %d nodes", len(resp.Kvs))
+	log.Info("loaded %d nodes", len(resp.Kvs))
 	return nil
 }
 

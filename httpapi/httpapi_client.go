@@ -118,7 +118,7 @@ func NewHttpClient(timeoutSecs int, encryptor Encryptor) *HttpClient {
 		httpClient: &http.Client{Timeout: time.Duration(timeoutSecs) * time.Second},
 		encryptor:  encryptor,
 	}
-	log.Info("[HTTPAPI] 客户端创建完成: timeout=%ds, encryptor=%T", timeoutSecs, encryptor)
+	log.Info("客户端创建完成: timeout=%ds, encryptor=%T", timeoutSecs, encryptor)
 	return client
 }
 
@@ -133,9 +133,9 @@ func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) (cal
 	startedAt := time.Now()
 	defer func() {
 		if callErr != nil {
-			log.Error("[HTTPAPI] JSON API 调用失败: url=%s, cost=%s, err=%v", reqURL, time.Since(startedAt), callErr)
+			log.Error("JSON API 调用失败: url=%s, cost=%s, err=%v", reqURL, time.Since(startedAt), callErr)
 		} else {
-			log.Info("[HTTPAPI] JSON API 调用成功: url=%s, cost=%s", reqURL, time.Since(startedAt))
+			log.Info("JSON API 调用成功: url=%s, cost=%s", reqURL, time.Since(startedAt))
 		}
 	}()
 
@@ -182,9 +182,9 @@ func (c *HttpClient) CallFormMap(reqURL string, reqBody any) (result map[string]
 	startedAt := time.Now()
 	defer func() {
 		if callErr != nil {
-			log.Error("[HTTPAPI] URL 编码表单调用失败: url=%s, cost=%s, err=%v", reqURL, time.Since(startedAt), callErr)
+			log.Error("URL 编码表单调用失败: url=%s, cost=%s, err=%v", reqURL, time.Since(startedAt), callErr)
 		} else {
-			log.Info("[HTTPAPI] URL 编码表单调用成功: url=%s, cost=%s", reqURL, time.Since(startedAt))
+			log.Info("URL 编码表单调用成功: url=%s, cost=%s", reqURL, time.Since(startedAt))
 		}
 	}()
 
@@ -336,9 +336,9 @@ func (c *HttpClient) RequestForm(reqURL string, fields map[string]string) (resul
 	startedAt := time.Now()
 	defer func() {
 		if callErr != nil {
-			log.Error("[HTTPAPI] multipart 表单调用失败: url=%s, cost=%s, err=%v", reqURL, time.Since(startedAt), callErr)
+			log.Error("multipart 表单调用失败: url=%s, cost=%s, err=%v", reqURL, time.Since(startedAt), callErr)
 		} else {
-			log.Info("[HTTPAPI] multipart 表单调用成功: url=%s, cost=%s", reqURL, time.Since(startedAt))
+			log.Info("multipart 表单调用成功: url=%s, cost=%s", reqURL, time.Since(startedAt))
 		}
 	}()
 

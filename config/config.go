@@ -328,7 +328,7 @@ func callCallbacks(callbacks map[string][]Callback, mu *sync.RWMutex, key string
 		go func(f Callback) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Error("[CONFIG] 配置变更回调 panic: path=%s, panic=%v", key, r)
+					log.Error("配置变更回调 panic: path=%s, panic=%v", key, r)
 				}
 			}()
 			f(oldVal, newVal)
@@ -339,17 +339,17 @@ func callCallbacks(callbacks map[string][]Callback, mu *sync.RWMutex, key string
 // Load reads the config file and starts watching it when enabled.
 func (l *Loader[T]) Load() (*T, error) {
 	if err := l.loadAndProcess(); err != nil {
-		log.Error("[CONFIG] 配置加载失败: path=%s, err=%v", l.path, err)
+		log.Error("配置加载失败: path=%s, err=%v", l.path, err)
 		return nil, err
 	}
 	if l.watch {
 		if err := l.startWatch(); err != nil {
-			log.Error("[CONFIG] 配置监听启动失败: path=%s, dir=%s, err=%v", l.path, l.dir, err)
+			log.Error("配置监听启动失败: path=%s, dir=%s, err=%v", l.path, l.dir, err)
 			return nil, err
 		}
-		log.Info("[CONFIG] 配置加载成功，已启动监听: path=%s, dir=%s", l.path, l.dir)
+		log.Info("配置加载成功，已启动监听: path=%s, dir=%s", l.path, l.dir)
 	} else {
-		log.Info("[CONFIG] 配置加载成功: path=%s", l.path)
+		log.Info("配置加载成功: path=%s", l.path)
 	}
 	return l.Get(), nil
 }
@@ -386,7 +386,7 @@ func (l *Loader[T]) loadAndProcess() error {
 	l.mu.Unlock()
 
 	if !isFirstLoad {
-		log.Info("[CONFIG] 检测到配置变化: path=%s, time=%s", l.path, time.Now().Format("15:04:05"))
+		log.Info("检测到配置变化: path=%s, time=%s", l.path, time.Now().Format("15:04:05"))
 		diffConfig(oldConf, newConf, "", l.triggerCallbacks)
 	}
 	return nil
@@ -436,9 +436,9 @@ func (l *Loader[T]) startWatch() error {
 				}
 				timer = time.AfterFunc(l.debounce, func() {
 					if err := l.loadAndProcess(); err != nil {
-						log.Error("[CONFIG] 自动加载配置失败: path=%s, err=%v", l.path, err)
+						log.Error("自动加载配置失败: path=%s, err=%v", l.path, err)
 					} else {
-						log.Info("[CONFIG] 自动加载配置成功: path=%s", l.path)
+						log.Info("自动加载配置成功: path=%s", l.path)
 					}
 				})
 				mu.Unlock()
@@ -447,7 +447,7 @@ func (l *Loader[T]) startWatch() error {
 				if !ok {
 					return
 				}
-				log.Error("[CONFIG] 文件监听异常: path=%s, err=%v", l.path, err)
+				log.Error("文件监听异常: path=%s, err=%v", l.path, err)
 			}
 		}
 	}()
@@ -653,14 +653,14 @@ func logChange(path string, oldVal, newVal reflect.Value) {
 	newAny := valueOf(newVal)
 
 	if oldEmpty && !newEmpty {
-		log.Info("[CONFIG][ADD] %s = %v", path, newAny)
+		log.Info("%s = %v", path, newAny)
 		return
 	}
 	if !oldEmpty && newEmpty {
-		log.Info("[CONFIG][DELETE] %s: remove (original %v)", path, oldAny)
+		log.Info("%s: remove (original %v)", path, oldAny)
 		return
 	}
-	log.Info("[CONFIG][MODIFY] %s: %v -> %v", path, oldAny, newAny)
+	log.Info("%s: %v -> %v", path, oldAny, newAny)
 }
 
 func isZero(v reflect.Value) bool {
