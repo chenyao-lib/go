@@ -41,6 +41,8 @@ import (
 	"github.com/outrigdev/goid"
 )
 
+type M = map[string]any
+
 // Level 定义日志级别，数值越小级别越低。
 type Level int
 
@@ -393,7 +395,50 @@ func Write(lv Level, levelTag string, leadingSpace bool, format string, args ...
 	}
 }
 
+// InfoM 输出 INFO 级别结构化日志，字段（map）在前，消息在后。
+func InfoM(m M, msg string, args ...any) {
+	formatted := fmt.Sprintf(msg, args...)
+	fieldStr := formatMap(m)
+	Write(LevelInfo, "INFO", false, "%s", formatted+fieldStr)
+}
+
+// ErrorM 输出 ERROR 级别结构化日志，字段在前，消息在后，带调用栈。
+func ErrorM(m M, msg string, args ...any) {
+	formatted := fmt.Sprintf(msg, args...)
+	fieldStr := formatMap(m)
+	Write(LevelError, "ERROR", false, "%s", formatted+fieldStr)
+}
+
+// WarnM 输出 WARN 级别结构化日志。
+func WarnM(m M, msg string, args ...any) {
+	formatted := fmt.Sprintf(msg, args...)
+	fieldStr := formatMap(m)
+	Write(LevelWarn, "WARN", false, "%s", formatted+fieldStr)
+}
+
+// DebugM 输出 DEBUG 级别结构化日志。
+func DebugM(m M, msg string, args ...any) {
+	formatted := fmt.Sprintf(msg, args...)
+	fieldStr := formatMap(m)
+	Write(LevelDebug, "DEBUG", false, "%s", formatted+fieldStr)
+}
+
 // ==================== 内部实现 ====================
+
+// formatMap 将 map 格式化为 " key1=val1 key2=val2"，若为空返回空字符串。
+func formatMap(m M) string {
+	if len(m) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for k, v := range m {
+		b.WriteString(", ")
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(fmt.Sprint(v))
+	}
+	return b.String()
+}
 
 func getCaller(skip int) string {
 	_, file, line, ok := runtime.Caller(skip)
