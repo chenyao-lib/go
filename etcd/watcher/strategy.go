@@ -12,4 +12,6 @@ type SelectStrategy interface {
 	GetNode(key string) string
 	// Nodes 返回所有节点列表
 	Nodes() []string
+	// Reset 清空所有节点（watch 断线重连后的全量重新同步使用）
+	Reset()
 }

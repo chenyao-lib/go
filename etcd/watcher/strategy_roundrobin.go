@@ -42,6 +42,14 @@ func (s *RoundRobinStrategy) RemoveNode(addr string) {
 	}
 }
 
+// Reset 清空所有节点（watch 断线重连后的全量重新同步使用）
+func (s *RoundRobinStrategy) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nodes = s.nodes[:0]
+	s.index.Store(0)
+}
+
 // GetNode 轮询选择节点
 // key 参数在轮询策略中忽略
 func (s *RoundRobinStrategy) GetNode(_ string) string {

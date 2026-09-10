@@ -46,8 +46,8 @@
 // AppName+Extensions 会按扩展名依次查找。三种方式只需选择一种。
 //
 // 热更新时 Loader 会替换内部配置指针，因此长期运行的代码应调用 loader.Get()
-// 读取最新快照，不要永久保存首次 Load 返回的指针。若使用包级 Get，调用方应在
-// 自己管理 Loader 时显式调用 Store 注册希望全局暴露的配置。
+// 读取最新快照，不要永久保存首次 Load 返回的指针。监听型 Loader 每次加载
+// （含热更新）会自动通过 Store 刷新全局注册，包级 Get 始终返回最新快照。
 //
 // # 变更回调
 //
@@ -388,6 +388,12 @@ func (l *Loader[T]) loadAndProcess() error {
 	if !isFirstLoad {
 		log.Info("检测到配置变化: path=%s, time=%s", l.path, time.Now().Format("15:04:05"))
 		diffConfig(oldConf, newConf, "", l.triggerCallbacks)
+	}
+
+	// 监听型 Loader 每次加载（含热更新）同步刷新全局注册，保证包级 Get[T]()
+	// 始终返回最新快照；LoadFile 等非监听用法不注册，避免覆盖 Init 注册的全局配置。
+	if l.watch {
+		Store(newConf)
 	}
 	return nil
 }

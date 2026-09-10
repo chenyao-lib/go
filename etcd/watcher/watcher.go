@@ -41,6 +41,9 @@
 // 轮询策略忽略 GetNode 的 key；一致性哈希策略使用 key 保持同一业务标识尽量
 // 落在同一节点。没有节点时两种策略都返回空字符串。
 //
+// watch 断开（etcd 重启、网络抖动等）会自动重连并全量重新同步节点列表，
+// 断连期间错过的节点增删不会造成本地列表与 etcd 长期不一致。
+//
 // # 默认实例
 //
 // 简单程序可调用 Init 创建包级 Default，然后用 watcher.GetNode。Init 支持
@@ -82,8 +85,9 @@ type NodeWatcher struct {
 	prefix    string
 	leaseTTL  int
 	strategy  SelectStrategy
-	ctx       context.Context
+	ctx       context.Context // 生命周期 context，仅 Close 时取消（与租约解耦）
 	cancel    context.CancelFunc
+	startOnce sync.Once
 	closeOnce sync.Once
 }
 
@@ -140,34 +144,39 @@ func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOptio
 }
 
 // Start 启动节点发现：
-//  1. 创建租约保活
+//  1. 创建租约保活（watcher 本身不注册服务，租约仅为兼容保留；失败不影响 watch）
 //  2. 加载已有 node
-//  3. 启动 watch
+//  3. 启动 watch（断线自动重连 + 全量重新同步）
 func (nw *NodeWatcher) Start() error {
-	// 1. 创建租约保活
-	ctx, cancel, err := createEtcdLease(nw.cli, nw.leaseTTL)
-	if err != nil {
-		log.Error("创建保活租约失败: prefix=%s, ttl=%ds, err=%v", nw.prefix, nw.leaseTTL, err)
-		nw.cli.Close()
-		return err
-	}
-	nw.ctx = ctx
-	nw.cancel = cancel
+	var startErr error
+	// startOnce 防重入：重复 Start 会覆盖 ctx/cancel 并启动多个 watch 协程。
+	nw.startOnce.Do(func() {
+		// 1. 生命周期 context：仅 Close 时取消。
+		// 旧实现把 watch 挂在租约保活的 context 上——etcd 重启/网络抖动导致
+		// keepalive 停止时会 cancel 掉 watch，节点列表从此冻结（错过的增删
+		// 永远补不上，哈希环里出现指向已死实例的僵尸节点）。现已解耦。
+		nw.ctx, nw.cancel = context.WithCancel(context.Background())
 
-	// 2. 加载已有 node（2s 超时，失败立即退出）
-	getCtx, getCancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer getCancel()
-	if err := nw.loadNodes(getCtx); err != nil {
-		log.Error("初始节点加载失败: prefix=%s, err=%v", nw.prefix, err)
-		nw.cancel()
-		nw.cli.Close()
-		return err
-	}
+		if _, _, err := createEtcdLease(nw.cli, nw.leaseTTL); err != nil {
+			log.Warn("创建保活租约失败(不影响 watch): prefix=%s, ttl=%ds, err=%v", nw.prefix, nw.leaseTTL, err)
+		}
 
-	// 3. 启动 watcher
-	go nw.watchNodes()
-	log.Info("节点发现启动成功: prefix=%s, strategy=%T, nodes=%d", nw.prefix, nw.strategy, len(nw.Nodes()))
-	return nil
+		// 2. 加载已有 node（2s 超时，失败立即退出）
+		getCtx, getCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer getCancel()
+		if err := nw.loadNodes(getCtx); err != nil {
+			log.Error("初始节点加载失败: prefix=%s, err=%v", nw.prefix, err)
+			nw.cancel()
+			nw.cli.Close()
+			startErr = err
+			return
+		}
+
+		// 3. 启动 watcher
+		go nw.watchNodes()
+		log.Info("节点发现启动成功: prefix=%s, strategy=%T, nodes=%d", nw.prefix, nw.strategy, len(nw.Nodes()))
+	})
+	return startErr
 }
 
 // Close 关闭节点发现器
@@ -232,37 +241,72 @@ func extractAddrFromKey(key, serverPrefix string) string {
 	return strings.TrimPrefix(key, serverPrefix)
 }
 
-// watchNodes 监听 etcd 中 node 的增删变化
+// watchNodes 监听 etcd 中 node 的增删变化。
+// watch 断开（etcd 重启、网络抖动、watch 粒度重建等导致 channel 关闭）后
+// 自动重连并全量重新同步节点——否则断连期间错过的增删会让本地列表永久冻结。
 func (nw *NodeWatcher) watchNodes() {
 	log.Info("etcd watch nodes started, prefix=%s", nw.prefix)
 
-	watchChan := nw.cli.Watch(nw.ctx, nw.prefix, clientv3.WithPrefix())
-	for wresp := range watchChan {
-		if wresp.Err() != nil {
-			log.Error("watch nodes error: %+v", wresp.Err())
-			continue
+	const retryDelay = 2 * time.Second
+
+	for nw.ctx.Err() == nil {
+		watchChan := nw.cli.Watch(nw.ctx, nw.prefix, clientv3.WithPrefix())
+
+		// 每轮都"先建 watch 再全量同步"：快照与 watch 建立之间的事件由
+		// channel 缓冲补放，配合 AddNode 去重 / RemoveNode 幂等保证最终一致。
+		// 若反过来先同步后建 watch，两步之间的事件会永久丢失。首轮也不例外
+		// （Start 的初始 loadNodes 与这里建 watch 之间同样存在窗口）。
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		nw.strategy.Reset()
+		if err := nw.loadNodes(syncCtx); err != nil {
+			log.Error("watch 节点全量同步失败(断线后将继续重试): prefix=%s, err=%v", nw.prefix, err)
 		}
-		for _, ev := range wresp.Events {
-			switch ev.Type {
-			case clientv3.EventTypePut:
-				addr := parseNodeAddr(ev.Kv.Value)
-				if addr != "" {
-					nw.strategy.AddNode(addr)
-					log.Info("Added node: %s", addr)
-				} else {
-					log.Error("parse node addr failed, key=%s value=%s", string(ev.Kv.Key), string(ev.Kv.Value))
-				}
-			case clientv3.EventTypeDelete:
-				addr := extractAddrFromKey(string(ev.Kv.Key), nw.prefix)
-				nw.strategy.RemoveNode(addr)
-				log.Info("Removed node: %s", addr)
+		syncCancel()
+
+		for wresp := range watchChan {
+			if wresp.Err() != nil {
+				log.Error("watch nodes error: %+v", wresp.Err())
+				continue
 			}
+			nw.applyEvents(wresp.Events)
+		}
+
+		// channel 关闭：要么正在 Close（ctx 已取消），要么 etcd 连接断开
+		if nw.ctx.Err() != nil {
+			break
+		}
+		log.Warn("etcd watch 断开, %s 后重连并全量同步节点: prefix=%s", retryDelay, nw.prefix)
+
+		time.Sleep(retryDelay)
+		if nw.ctx.Err() != nil {
+			break
 		}
 	}
+
 	if nw.ctx != nil && nw.ctx.Err() != nil {
 		log.Info("节点监听正常退出: prefix=%s", nw.prefix)
 	} else {
 		log.Warn("节点监听意外退出: prefix=%s", nw.prefix)
+	}
+}
+
+// applyEvents 把一批 watch 事件应用到节点策略
+func (nw *NodeWatcher) applyEvents(events []*clientv3.Event) {
+	for _, ev := range events {
+		switch ev.Type {
+		case clientv3.EventTypePut:
+			addr := parseNodeAddr(ev.Kv.Value)
+			if addr != "" {
+				nw.strategy.AddNode(addr)
+				log.Info("Added node: %s", addr)
+			} else {
+				log.Error("parse node addr failed, key=%s value=%s", string(ev.Kv.Key), string(ev.Kv.Value))
+			}
+		case clientv3.EventTypeDelete:
+			addr := extractAddrFromKey(string(ev.Kv.Key), nw.prefix)
+			nw.strategy.RemoveNode(addr)
+			log.Info("Removed node: %s", addr)
+		}
 	}
 }
 
