@@ -18,6 +18,9 @@
 //		log.Info("server started at %s", ":8080")
 //	}
 //
+// 致命退出请使用 log.Fatal / log.FatalM，而不要直接 os.Exit：它们会先刷新缓冲区再退出，
+// 避免丢失崩溃现场尚未落盘的日志。
+//
 // 即使不调用 Init，日志也会默认写入 ./logs/log_YYYYMMDD.log，级别为 DEBUG。
 //
 // 该包经过并发安全优化，所有配置字段通过 atomic.Value 存储，消除数据竞争；
@@ -51,6 +54,7 @@ const (
 	LevelInfo               // 常规信息
 	LevelWarn               // 警告
 	LevelError              // 错误（会附带调用栈）
+	LevelFatal              // 致命错误（附带调用栈，通常紧接进程退出）
 )
 
 const (
@@ -92,13 +96,16 @@ type Logger struct {
 	reopen      bool // 标记是否需要重新打开文件（配置变更时置 true）
 
 	// 异步通道
-	logCh chan string
-	wg    sync.WaitGroup
+	logCh  chan string
+	stopCh chan struct{} // Close 时关闭，通知后台协程退出（不关闭 logCh，避免并发 send panic）
+	closed atomic.Bool   // 标记已 Close，Write 据此直接丢弃后续日志
+	wg     sync.WaitGroup
 }
 
 // std 是包级默认实例，在 init 中初始化并启动后台协程。
 var std = &Logger{
-	logCh: make(chan string, defaultChanCap),
+	logCh:  make(chan string, defaultChanCap),
+	stopCh: make(chan struct{}),
 }
 
 // init 在包加载时自动设置默认配置并启动后台写入协程，实现零配置可用。
@@ -292,34 +299,45 @@ func SetTimezone(name string) error {
 	return nil
 }
 
+// closeOnce 保证 Close 只真正执行一次。
+// Fatal/FatalM 会先 Close 再 os.Exit，可能与调用方 defer 的 Close 重叠，
+// 而重复 close(stopCh) 会 panic，故用 Once 收敛。
+var closeOnce sync.Once
+
 // Close 关闭日志系统，刷新所有缓冲区，并等待后台协程将所有已入队日志写入完成。
 //
-// 应在程序退出前调用（通常使用 defer）。调用后不能再写入日志。
+// 应在程序退出前调用（通常使用 defer）。调用后再写入的日志会被直接丢弃（不会 panic）。
 //
-// 注意：如果程序异常退出（如 panic）未调用 Close，可能会丢失少量缓冲中的日志，
-// 但已发送到通道的消息会在后台协程退出前处理完（通道关闭时会排空）。
+// 幂等：重复调用安全（仅首次生效），因此可同时被 defer 与 Fatal/FatalM 调用。
+//
+// 实现说明：这里关闭的是 stopCh 而不是 logCh。若关闭 logCh，其它协程在关闭瞬间仍执行到
+// Write 里的 select { case logCh <- line }，会触发 send on closed channel panic（select 的
+// default 无法兜住）；改为"发信号 + 后台协程排空通道"，任何并发写入都是安全的。
 func Close() {
-	// 关闭通道，通知后台协程退出
-	if std.logCh != nil {
-		close(std.logCh)
-	}
-	// 等待后台协程处理完所有消息并退出
-	std.wg.Wait()
-
-	// 最后刷新并关闭文件（此时后台协程已退出，可直接操作）
-	std.mu.Lock()
-	defer std.mu.Unlock()
-	std.stopFlusher()
-	if std.bufw != nil {
-		std.bufw.Flush()
-		std.bufw = nil
-	}
-	if std.logFile != nil {
-		if err := std.logFile.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "close logfile error: %v\n", err)
+	closeOnce.Do(func() {
+		std.closed.Store(true)
+		// 发信号通知后台协程退出（不关闭 logCh）
+		if std.stopCh != nil {
+			close(std.stopCh)
 		}
-		std.logFile = nil
-	}
+		// 等待后台协程排空已入队日志并退出
+		std.wg.Wait()
+
+		// 兜底：正常情况下后台协程退出前已刷新关闭；此处对 nil 安全，可重复执行
+		std.mu.Lock()
+		defer std.mu.Unlock()
+		std.stopFlusher()
+		if std.bufw != nil {
+			std.bufw.Flush()
+			std.bufw = nil
+		}
+		if std.logFile != nil {
+			if err := std.logFile.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "close logfile error: %v\n", err)
+			}
+			std.logFile = nil
+		}
+	})
 }
 
 // ==================== 日志输出函数 ====================
@@ -338,6 +356,20 @@ func Info(format string, args ...any) {
 // 行为同 Info，但级别为 Error。
 func Error(format string, args ...any) {
 	Write(LevelError, "ERROR", true, format, args...)
+}
+
+// Fatal 输出 FATAL 级别日志，随后刷新缓冲区并以状态码 1 退出进程。格式同 fmt.Printf。
+//
+// 与 Error 的区别是 Fatal 不会返回：它先 Close（排空异步缓冲区、关闭日志文件）再
+// os.Exit(1)。致命退出不要直接调用 os.Exit——那会跳过调用方 defer 的 Close，
+// 使缓冲区中尚未落盘的日志（通常正是崩溃现场）丢失。
+//
+// 日志级别为 LevelFatal（≥LevelError，同样附带调用栈）；SetLevel 到 LevelError 及以下都不会过滤掉它。
+// 注意：调用后进程立即退出，不会再有任何日志写入；不适用于可恢复的错误。
+func Fatal(format string, args ...any) {
+	Write(LevelFatal, "FATAL", true, format, args...)
+	Close()
+	os.Exit(1)
 }
 
 // Warn 输出 WARN 级别日志，格式同 fmt.Printf。
@@ -368,6 +400,11 @@ func Write(lv Level, levelTag string, leadingSpace bool, format string, args ...
 		return
 	}
 
+	// 已 Close：直接丢弃，避免往无人消费的通道堆积（也避免打满缓冲后刷屏 stderr）
+	if std.closed.Load() {
+		return
+	}
+
 	cfg := std.config.Load().(*config) // 获取当前配置
 
 	msg := fmt.Sprintf(format, args...)
@@ -376,9 +413,9 @@ func Write(lv Level, levelTag string, leadingSpace bool, format string, args ...
 	}
 	caller := getCaller(3)
 
-	// Error 级别附加调用栈
+	// Error 及以上级别附加调用栈（Fatal 亦需要）
 	stack := ""
-	if lv == LevelError {
+	if lv >= LevelError {
 		stack = getStack()
 	}
 
@@ -407,6 +444,17 @@ func ErrorM(m M, msg string, args ...any) {
 	formatted := fmt.Sprintf(msg, args...)
 	fieldStr := formatMap(m)
 	Write(LevelError, "ERROR", false, "%s", formatted+fieldStr)
+}
+
+// FatalM 输出 FATAL 级别结构化日志（字段在前，消息在后），随后刷新缓冲区并退出进程。
+//
+// 行为同 Fatal，只是附带结构化字段，字段格式与 InfoM/ErrorM 一致。
+func FatalM(m M, msg string, args ...any) {
+	formatted := fmt.Sprintf(msg, args...)
+	fieldStr := formatMap(m)
+	Write(LevelFatal, "FATAL", false, "%s", formatted+fieldStr)
+	Close()
+	os.Exit(1)
 }
 
 // WarnM 输出 WARN 级别结构化日志。
@@ -498,71 +546,92 @@ func resolveTimezone(name string) (*time.Location, error) {
 func (l *Logger) backgroundWriter() {
 	defer l.wg.Done()
 
-	for msg := range l.logCh {
-		l.mu.Lock()
-		cfg := l.config.Load().(*config)
-
-		// 处理配置变更（重新打开文件）
-		if l.reopen {
-			l.reopen = false
-			// 关闭旧文件并重置缓冲区
-			if l.bufw != nil {
-				l.bufw.Flush()
-				l.bufw = nil
-			}
-			if l.logFile != nil {
-				l.logFile.Close()
-				l.logFile = nil
-				l.logTime = time.Time{}
-			}
-			// 停止旧定时器，稍后根据新配置重启
-			l.stopFlusher()
-		}
-
-		// 如果文件未打开，打开它（使用当前时间）
-		if l.logFile == nil {
-			now := time.Now().In(cfg.location)
-			if err := l.rotate(now); err != nil {
-				fmt.Fprintf(os.Stderr, "open logfile error: %v\n", err)
-				l.mu.Unlock()
-				continue
-			}
-			// 如果配置了刷新间隔，启动定时器
-			if cfg.flushInterval > 0 {
-				l.startFlusher()
+	for {
+		select {
+		case msg := <-l.logCh:
+			l.handle(msg)
+		case <-l.stopCh:
+			// 收到关闭信号：先把通道中已入队的日志排空，再退出。
+			// 注意不要关闭 logCh —— 那会让关闭瞬间仍在 Write 的协程 panic。
+			for {
+				select {
+				case msg := <-l.logCh:
+					l.handle(msg)
+				default:
+					l.flushAndClose()
+					return
+				}
 			}
 		}
+	}
+}
 
-		// 写入文件（经过 buffer）
+// handle 处理单条日志：按需轮转/打开文件、写入缓冲区并输出到控制台。
+func (l *Logger) handle(msg string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	cfg := l.config.Load().(*config)
+
+	// 处理配置变更（重新打开文件）
+	if l.reopen {
+		l.reopen = false
+		// 关闭旧文件并重置缓冲区
 		if l.bufw != nil {
-			if _, err := l.bufw.WriteString(msg); err != nil {
-				fmt.Fprintf(os.Stderr, "write buffer error: %v\n", err)
-				// 尝试直接写文件
-				if l.logFile != nil {
-					l.logFile.WriteString(msg)
-				}
-			}
-			// 如果缓冲区满，立即刷新
-			if l.bufw.Buffered() >= cfg.bufSize {
-				if err := l.bufw.Flush(); err != nil {
-					fmt.Fprintf(os.Stderr, "flush buffer error: %v\n", err)
-				}
-			}
-		} else if l.logFile != nil {
-			if _, err := l.logFile.WriteString(msg); err != nil {
-				fmt.Fprintf(os.Stderr, "write logfile error: %v\n", err)
-			}
+			l.bufw.Flush()
+			l.bufw = nil
 		}
-
-		// 控制台输出
-		if cfg.console {
-			fmt.Print(msg)
+		if l.logFile != nil {
+			l.logFile.Close()
+			l.logFile = nil
+			l.logTime = time.Time{}
 		}
-
-		l.mu.Unlock()
+		// 停止旧定时器，稍后根据新配置重启
+		l.stopFlusher()
 	}
 
-	// 通道关闭，退出前刷新并关闭文件
+	// 如果文件未打开，打开它（使用当前时间）
+	if l.logFile == nil {
+		now := time.Now().In(cfg.location)
+		if err := l.rotate(now); err != nil {
+			fmt.Fprintf(os.Stderr, "open logfile error: %v\n", err)
+			return
+		}
+		// 如果配置了刷新间隔，启动定时器
+		if cfg.flushInterval > 0 {
+			l.startFlusher()
+		}
+	}
+
+	// 写入文件（经过 buffer）
+	if l.bufw != nil {
+		if _, err := l.bufw.WriteString(msg); err != nil {
+			fmt.Fprintf(os.Stderr, "write buffer error: %v\n", err)
+			// 尝试直接写文件
+			if l.logFile != nil {
+				l.logFile.WriteString(msg)
+			}
+		}
+		// 如果缓冲区满，立即刷新
+		if l.bufw.Buffered() >= cfg.bufSize {
+			if err := l.bufw.Flush(); err != nil {
+				fmt.Fprintf(os.Stderr, "flush buffer error: %v\n", err)
+			}
+		}
+	} else if l.logFile != nil {
+		if _, err := l.logFile.WriteString(msg); err != nil {
+			fmt.Fprintf(os.Stderr, "write logfile error: %v\n", err)
+		}
+	}
+
+	// 控制台输出
+	if cfg.console {
+		fmt.Print(msg)
+	}
+}
+
+// flushAndClose 退出前刷新缓冲区并关闭文件。
+func (l *Logger) flushAndClose() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.stopFlusher()
