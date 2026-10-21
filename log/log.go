@@ -590,9 +590,10 @@ func (l *Logger) handle(msg string) {
 		l.stopFlusher()
 	}
 
+	now := time.Now().In(cfg.location)
+
 	// 如果文件未打开，打开它（使用当前时间）
 	if l.logFile == nil {
-		now := time.Now().In(cfg.location)
 		if err := l.rotate(now); err != nil {
 			fmt.Fprintf(os.Stderr, "open logfile error: %v\n", err)
 			return
@@ -600,6 +601,15 @@ func (l *Logger) handle(msg string) {
 		// 如果配置了刷新间隔，启动定时器
 		if cfg.flushInterval > 0 {
 			l.startFlusher()
+		}
+	} else if l.needRotate(now) {
+		// 运行期也要检查跨天 / 超过 maxSize：needRotate 原本只经 rotate()
+		// 调用，而 rotate() 只在 logFile == nil（首次打开 / reopen）时执行，
+		// 导致进程跨天不换文件、单文件可远超 maxSize
+		// （线上实测 app_20261016.log 涨到 421MB，配置上限 100MB）。
+		// 轮转失败只报错并继续写旧文件，避免丢日志。
+		if err := l.rotate(now); err != nil {
+			fmt.Fprintf(os.Stderr, "rotate logfile error: %v\n", err)
 		}
 	}
 
@@ -662,8 +672,24 @@ func (l *Logger) rotate(t time.Time) error {
 	baseName := fmt.Sprintf("%s_%04d%02d%02d", cfg.prefix, t.Year(), t.Month(), t.Day())
 	fileName := filepath.Join(cfg.dir, baseName+".log")
 
+	// 先落盘并关闭旧文件：Windows 下句柄未释放时 os.Rename 会失败
+	// （"The process cannot access the file because it is being used by
+	// another process"），Linux 上则无所谓。统一先关再改名，跨平台一致。
+	if l.bufw != nil {
+		l.bufw.Flush()
+		l.bufw = nil
+	}
+	if l.logFile != nil {
+		if err := l.logFile.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close old logfile error: %v\n", err)
+		}
+		l.logFile = nil
+	}
+
+	// 超过 maxSize 时把当前文件转成 _N 备份。改名失败不阻断日志写入：
+	// 继续往原文件追加，总比丢日志好。
 	if err := rotateFileIfNeeded(fileName, cfg.dir, baseName, cfg.maxSize); err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "rotate logfile error: %v\n", err)
 	}
 
 	f, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
@@ -671,11 +697,6 @@ func (l *Logger) rotate(t time.Time) error {
 		return fmt.Errorf("open logfile[%s]: %w", fileName, err)
 	}
 
-	// 关闭旧文件前刷新旧 buffer
-	if l.bufw != nil {
-		l.bufw.Flush()
-	}
-	oldFile := l.logFile
 	l.logFile = f
 	l.logTime = t
 
@@ -684,12 +705,6 @@ func (l *Logger) rotate(t time.Time) error {
 		l.bufw = bufio.NewWriterSize(f, cfg.bufSize)
 	} else {
 		l.bufw = nil
-	}
-
-	if oldFile != nil {
-		if err := oldFile.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "close old logfile error: %v\n", err)
-		}
 	}
 
 	l.cleanupOldFiles(t)
@@ -710,7 +725,15 @@ func (l *Logger) needRotate(t time.Time) bool {
 		return true
 	}
 	cfg := l.config.Load().(*config)
-	return stat.Size() >= cfg.maxSize
+
+	// 缓冲区里可能还压着最多一个 bufSize 的字节没有落盘，只看磁盘大小会让
+	// 判定整整滞后一个缓冲区——maxSize 小于 bufSize（如 64KB）时永远触发不了。
+	size := stat.Size()
+	if l.bufw != nil {
+		size += int64(l.bufw.Buffered())
+	}
+
+	return size >= cfg.maxSize
 }
 
 func rotateFileIfNeeded(fileName, dir, baseName string, maxSize int64) error {
