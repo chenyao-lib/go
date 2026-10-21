@@ -184,6 +184,16 @@ type Service struct {
 	quit  chan struct{}
 	wg    sync.WaitGroup
 
+	// lifecycleMu 串行化 Start/Stop，保证 quit/monitorQuit 只关闭一次。
+	// stopped 一旦置 true 就禁止再次 Start：旧实现 Stop 后状态回到 Stopped，
+	// 再次 Start 会重新 close(quit)，panic: close of closed channel。
+	lifecycleMu sync.Mutex
+	stopped     bool
+
+	// timeoutsMu 保护 methodTimeouts / callTimeouts：旧实现运行期调用
+	// SetMethodTimeout 会与 handler 协程的读并发触发 concurrent map write。
+	timeoutsMu sync.RWMutex
+
 	state       atomic.Int32
 	sessionSeed atomic.Int64
 
@@ -277,6 +287,9 @@ func (s *Service) SetDefaultCallTimeout(timeout time.Duration) {
 }
 
 func (s *Service) SetMethodTimeout(method string, timeout time.Duration) {
+	s.timeoutsMu.Lock()
+	defer s.timeoutsMu.Unlock()
+
 	if s.methodTimeouts == nil {
 		s.methodTimeouts = make(map[string]time.Duration)
 	}
@@ -284,6 +297,9 @@ func (s *Service) SetMethodTimeout(method string, timeout time.Duration) {
 }
 
 func (s *Service) SetMethodTimeouts(timeouts map[string]time.Duration) {
+	s.timeoutsMu.Lock()
+	defer s.timeoutsMu.Unlock()
+
 	if s.methodTimeouts == nil {
 		s.methodTimeouts = make(map[string]time.Duration, len(timeouts))
 	}
@@ -293,6 +309,9 @@ func (s *Service) SetMethodTimeouts(timeouts map[string]time.Duration) {
 }
 
 func (s *Service) SetCallTimeout(method string, timeout time.Duration) {
+	s.timeoutsMu.Lock()
+	defer s.timeoutsMu.Unlock()
+
 	if s.callTimeouts == nil {
 		s.callTimeouts = make(map[string]time.Duration)
 	}
@@ -300,6 +319,9 @@ func (s *Service) SetCallTimeout(method string, timeout time.Duration) {
 }
 
 func (s *Service) SetCallTimeouts(timeouts map[string]time.Duration) {
+	s.timeoutsMu.Lock()
+	defer s.timeoutsMu.Unlock()
+
 	if s.callTimeouts == nil {
 		s.callTimeouts = make(map[string]time.Duration, len(timeouts))
 	}
@@ -346,7 +368,19 @@ func GetService(name string) (*Service, bool) {
 // ==================== 生命周期 ====================
 
 func (s *Service) Start() error {
+	// 串行化 Start/Stop：避免 Stop 关闭 quit 之后 Start 又把循环拉起来，
+	// 也避免并发 Stop 重复 close(quit) 导致 panic。
+	s.lifecycleMu.Lock()
+
+	if s.stopped {
+		s.lifecycleMu.Unlock()
+		err := fmt.Errorf("service %s: Stop has been called, restart is not allowed", s.name)
+		s.Warn("start rejected: %v", err)
+		return err
+	}
+
 	if !s.state.CompareAndSwap(int32(StateStopped), int32(StateRunning)) {
+		s.lifecycleMu.Unlock()
 		err := fmt.Errorf("service %s already started", s.name)
 		s.Warn("start rejected: %v", err)
 		return err
@@ -354,6 +388,7 @@ func (s *Service) Start() error {
 
 	if err := globalReg.register(s.name, s); err != nil {
 		s.state.Store(int32(StateStopped))
+		s.lifecycleMu.Unlock()
 		wrapped := fmt.Errorf("register %s: %w", s.name, err)
 		s.Error("register failed: %v", wrapped)
 		return wrapped
@@ -362,15 +397,20 @@ func (s *Service) Start() error {
 	s.wg.Add(1)
 	go s.loop()
 
-	if err := s.runInit(); err != nil {
+	initErr := s.runInit()
+	if initErr != nil {
+		// 必须先释放 lifecycleMu 再调用 Stop（Stop 会重新获取同一把锁）。
+		s.lifecycleMu.Unlock()
 		s.Stop()
-		return fmt.Errorf("init %s: %w", s.name, err)
+		return fmt.Errorf("init %s: %w", s.name, initErr)
 	}
 
 	if s.config.MonitorInterval > 0 {
 		s.wg.Add(1)
 		go s.monitor()
 	}
+
+	s.lifecycleMu.Unlock()
 
 	s.Info("started (queue=%d)", s.config.QueueSize)
 	return nil
@@ -394,9 +434,23 @@ func (s *Service) runInit() error {
 }
 
 func (s *Service) Stop() {
-	if !s.state.CompareAndSwap(int32(StateRunning), int32(StateStopping)) {
+	s.lifecycleMu.Lock()
+
+	if s.stopped {
+		// 已经停过：quit/monitorQuit 不能重复 close，直接返回。
+		s.lifecycleMu.Unlock()
 		return
 	}
+
+	if !s.state.CompareAndSwap(int32(StateRunning), int32(StateStopping)) {
+		// 未启动或已处于停止流程，不关闭任何 channel。
+		s.lifecycleMu.Unlock()
+		return
+	}
+
+	// 进入停止流程即标记为终态：Start 会拒绝再次启动，避免
+	// "loop 立刻退出 + 二次 Stop 重复 close" 的组合。
+	s.stopped = true
 
 	globalReg.unregister(s.name)
 
@@ -405,6 +459,8 @@ func (s *Service) Stop() {
 	}
 
 	close(s.quit)
+
+	s.lifecycleMu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -516,14 +572,20 @@ func (s *Service) handleOne(msg *ServiceMsg) {
 }
 
 func (s *Service) handlerTimeout(method string) time.Duration {
-	if timeout, ok := s.methodTimeouts[method]; ok {
+	s.timeoutsMu.RLock()
+	timeout, ok := s.methodTimeouts[method]
+	s.timeoutsMu.RUnlock()
+	if ok {
 		return timeout
 	}
 	return s.config.HandlerTimeout
 }
 
 func (s *Service) callTimeout(method string) time.Duration {
-	if timeout, ok := s.callTimeouts[method]; ok {
+	s.timeoutsMu.RLock()
+	timeout, ok := s.callTimeouts[method]
+	s.timeoutsMu.RUnlock()
+	if ok {
 		return timeout
 	}
 	return s.config.CallTimeout

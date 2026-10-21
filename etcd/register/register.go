@@ -91,9 +91,14 @@ type RegisterOption struct {
 	GrantTimeout time.Duration
 
 	// AutoReRegister 租约丢失后是否自动重新注册。
-	// 默认 true，会在 keepalive 断开后自动尝试 ReRegister()。
-	// 设为 false 则仅触发 OnLeaseLost 回调。
+	// 由 setDefaults 根据 DisableAutoReRegister 计算得出（默认 true），
+	// 调用方不要直接赋值，否则会在 setDefaults 中被覆盖。
 	AutoReRegister bool
+
+	// DisableAutoReRegister 显式关闭自动重新注册。
+	// 旧实现无条件把 AutoReRegister 置为 true，调用方设 false 会被静默覆盖；
+	// 需要关闭时请设置本字段。
+	DisableAutoReRegister bool
 
 	// OnLeaseLost 租约丢失回调。
 	//   - AutoReRegister=true ：自动重注册失败时触发，err 为重注册错误
@@ -132,7 +137,9 @@ func (o *RegisterOption) setDefaults() {
 	if o.GrantTimeout <= 0 {
 		o.GrantTimeout = 5 * time.Second
 	}
-	o.AutoReRegister = true
+	// AutoReRegister 由 DisableAutoReRegister 取反得出，避免旧实现
+	// 无条件覆盖调用方传值（传 false 会被静默改成 true）。
+	o.AutoReRegister = !o.DisableAutoReRegister
 }
 
 // ---------------------------------------------------------------------------

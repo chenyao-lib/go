@@ -53,17 +53,16 @@ func (s *RoundRobinStrategy) Reset() {
 // GetNode 轮询选择节点
 // key 参数在轮询策略中忽略
 func (s *RoundRobinStrategy) GetNode(_ string) string {
+	// 取长度与取节点必须在同一把读锁内完成：旧实现分两次 RLock，
+	// 中间若 RemoveNode 让节点数变少，s.nodes[idx] 会越界 panic。
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	n := len(s.nodes)
-	s.mu.RUnlock()
 	if n == 0 {
 		return ""
 	}
-	idx := s.index.Add(1) % int32(n)
-	s.mu.RLock()
-	addr := s.nodes[idx]
-	s.mu.RUnlock()
-	return addr
+	idx := int(s.index.Add(1)) % n
+	return s.nodes[idx]
 }
 
 func (s *RoundRobinStrategy) Nodes() []string {
