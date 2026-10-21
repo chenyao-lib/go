@@ -3,6 +3,8 @@
 //
 // # 特性
 //   - 零配置启动：即使不调用 Init，也会使用默认配置（./logs 目录、100MB 滚动、DEBUG 级别）。
+//     Init 之前的日志先暂存在内存（同时输出控制台），宽限 1 秒内仍未 Init 才按默认配置落盘，
+//     因此不会因为启动期日志而多出一个默认前缀的文件。
 //   - 非阻塞写入：所有日志写入操作均通过通道发送到后台协程，用户协程永不阻塞。
 //   - 并发安全：所有公开函数均可安全地在多个 goroutine 中同时调用。
 //   - 动态配置：可在运行时调整级别、保留策略、缓冲参数等，无需重启。
@@ -21,7 +23,9 @@
 // 致命退出请使用 log.Fatal / log.FatalM，而不要直接 os.Exit：它们会先刷新缓冲区再退出，
 // 避免丢失崩溃现场尚未落盘的日志。
 //
-// 即使不调用 Init，日志也会默认写入 ./logs/log_YYYYMMDD.log，级别为 DEBUG。
+// 即使不调用 Init，日志也会默认写入 ./logs/log_YYYYMMDD.log，级别为 DEBUG；
+// Init 之前的日志会先缓冲最多 1 秒（可用环境变量 LOG_INIT_GRACE_MS 覆盖，
+// 设为 0 关闭缓冲），以保证"启动期日志 + main 里 Init"只产生一个日志文件。
 //
 // 该包经过并发安全优化，所有配置字段通过 atomic.Value 存储，消除数据竞争；
 // 备份文件清理使用正则匹配，避免前缀含下划线导致解析失效。
@@ -65,6 +69,20 @@ const (
 	defaultFlushIntvl = 5 * time.Second
 	defaultChanCap    = 10000 // 通道容量，最多缓存 10000 条未处理日志
 	timestampLayout   = "2006-01-02 15:04:05.000000000"
+
+	// defaultInitGrace 是 Init 前日志的缓冲宽限时间。
+	// 进程启动时各包的 init() 早于 main()，若它们写日志，默认会先落到
+	// prefix=log 的文件；main 里再调用 Init("app", ...) 就会切换文件，
+	// 同一天出现 log_ 与 app_ 两个文件。缓冲宽限让正常的"main 开头 Init"
+	// 在落盘前完成切换，只产生 Init 配置的那一个文件。
+	defaultInitGrace = time.Second
+	// maxPendingLines 是 Init 前缓冲的最大条数，超出后立刻按默认配置落盘，
+	// 防止长时间未 Init 的进程无限占用内存。
+	maxPendingLines = 2000
+	// initGraceEnv 允许用 LOG_INIT_GRACE_MS 覆盖宽限时间（毫秒）。
+	// 设为 0 表示关闭缓冲：Init 前的日志尽快按默认配置落盘（后台异步处理
+	// 仍可能与 Init 竞争，若 Init 更早生效则直接写入 Init 配置的文件）。
+	initGraceEnv = "LOG_INIT_GRACE_MS"
 )
 
 // config 包含所有可动态调整的配置参数，通过 atomic.Value 原子存储指针，实现无锁读取。
@@ -95,6 +113,16 @@ type Logger struct {
 	flushDone   chan struct{}
 	reopen      bool // 标记是否需要重新打开文件（配置变更时置 true）
 
+	// Init 之前的日志缓冲，受 mu 保护。
+	// initialized 为 false 时日志只进 pendingLines 与控制台，不创建文件；
+	// Init 会把暂存内容写入新配置的文件；若宽限内没有 Init（或缓冲溢出），
+	// 定时器/写入路径会按默认配置落盘，保证零配置用法仍然可用。
+	initialized  bool
+	pendingLines []string
+	pendingSince time.Time
+	pendingTimer *time.Timer
+	initGrace    time.Duration
+
 	// 异步通道
 	logCh  chan string
 	stopCh chan struct{} // Close 时关闭，通知后台协程退出（不关闭 logCh，避免并发 send panic）
@@ -123,9 +151,25 @@ func init() {
 		flushInterval: defaultFlushIntvl,
 	})
 	std.level.Store(int32(LevelDebug))
+	std.initGrace = resolveInitGrace()
 
 	std.wg.Add(1)
 	go std.backgroundWriter()
+}
+
+// resolveInitGrace 解析 LOG_INIT_GRACE_MS，非法值回退默认宽限；
+// 0 表示关闭缓冲（Init 前的日志尽快落盘）。
+func resolveInitGrace() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(initGraceEnv))
+	if raw == "" {
+		return defaultInitGrace
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms < 0 {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q, use default %s\n", initGraceEnv, raw, defaultInitGrace)
+		return defaultInitGrace
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // ==================== 公开配置函数 ====================
@@ -141,7 +185,9 @@ func init() {
 //   - maxAge: 备份文件的最大保留时间（如 7*24*time.Hour），0 表示不限制。
 //
 // 注意：若调用时已有文件打开，会平滑切换到新配置（关闭旧文件，创建新文件），
-// 切换过程中已入队的日志不会丢失。
+// 切换过程中已入队的日志不会丢失。Init 之前产生的日志会暂存在内存中，并在
+// Init 时写入新配置的文件，因此"包 init() 先打日志、main 里再 Init"的程序
+// 不会在当天同时留下默认前缀与 Init 前缀两个日志文件。
 func Init(prefix, dir string, maxSize int64, lv Level, maxBackups int, maxAge time.Duration) {
 	prefix = sanitizePrefix(prefix)
 	if dir == "" {
@@ -172,11 +218,31 @@ func Init(prefix, dir string, maxSize int64, lv Level, maxBackups int, maxAge ti
 
 	std.level.Store(int32(lv))
 
-	// 标记需要重新打开文件（因为 dir 或 prefix 可能变化）
-	std.reopen = true
+	std.initialized = true
+	std.stopPendingTimerLocked()
+	now := time.Now().In(newCfg.location)
+
+	// Init 前已有日志：立即关闭可能存在的旧文件、按新配置打开文件并补写暂存
+	// 内容。这样启动期日志直接进入 Init 指定的文件，不会先落到默认 prefix 的
+	// 文件里，同一天也就不会出现两个日志文件。
+	if len(std.pendingLines) > 0 {
+		std.closeFileLocked()
+		if err := std.rotate(now); err != nil {
+			fmt.Fprintf(os.Stderr, "open logfile error: %v\n", err)
+			// 保留暂存内容，下一条日志打开文件后会补写，避免丢失启动日志。
+		} else {
+			std.writePendingLocked()
+			if std.flushTicker == nil && newCfg.flushInterval > 0 {
+				std.startFlusher()
+			}
+		}
+	} else {
+		// 标记需要重新打开文件（因为 dir 或 prefix 可能变化）
+		std.reopen = true
+	}
 
 	// 立即执行一次清理（使用新配置）
-	std.cleanupOldFiles(time.Now())
+	std.cleanupOldFiles(now)
 }
 
 // SetRetention 动态调整备份文件的保留策略。
@@ -326,6 +392,7 @@ func Close() {
 		// 兜底：正常情况下后台协程退出前已刷新关闭；此处对 nil 安全，可重复执行
 		std.mu.Lock()
 		defer std.mu.Unlock()
+		std.stopPendingTimerLocked()
 		std.stopFlusher()
 		if std.bufw != nil {
 			std.bufw.Flush()
@@ -577,20 +644,17 @@ func (l *Logger) handle(msg string) {
 	if l.reopen {
 		l.reopen = false
 		// 关闭旧文件并重置缓冲区
-		if l.bufw != nil {
-			l.bufw.Flush()
-			l.bufw = nil
-		}
-		if l.logFile != nil {
-			l.logFile.Close()
-			l.logFile = nil
-			l.logTime = time.Time{}
-		}
-		// 停止旧定时器，稍后根据新配置重启
-		l.stopFlusher()
+		l.closeFileLocked()
 	}
 
 	now := time.Now().In(cfg.location)
+
+	// Init 之前：日志只写控制台并暂存内存，不创建文件。宽限内 Init 时由 Init
+	// 写入其配置的文件；若一直不 Init，则由定时器/溢出按默认配置落盘。
+	if !l.initialized && l.logFile == nil {
+		l.bufferBeforeInitLocked(msg, now, cfg)
+		return
+	}
 
 	// 如果文件未打开，打开它（使用当前时间）
 	if l.logFile == nil {
@@ -612,6 +676,9 @@ func (l *Logger) handle(msg string) {
 			fmt.Fprintf(os.Stderr, "rotate logfile error: %v\n", err)
 		}
 	}
+
+	// 补写 Init 时打开文件失败而遗留的暂存日志
+	l.writePendingLocked()
 
 	// 写入文件（经过 buffer）
 	if l.bufw != nil {
@@ -640,10 +707,127 @@ func (l *Logger) handle(msg string) {
 	}
 }
 
+// bufferBeforeInitLocked 在 Init 尚未调用时暂存日志，并在宽限到期或缓冲溢出时
+// 按默认配置落盘。调用方必须持有 mu。
+func (l *Logger) bufferBeforeInitLocked(msg string, now time.Time, cfg *config) {
+	l.pendingLines = append(l.pendingLines, msg)
+	if cfg.console {
+		fmt.Print(msg)
+	}
+	if l.pendingSince.IsZero() {
+		l.pendingSince = now
+	}
+
+	// 关闭缓冲（initGrace<=0）、缓冲溢出或已超过宽限：按默认配置落盘。
+	if l.initGrace <= 0 || len(l.pendingLines) >= maxPendingLines || now.Sub(l.pendingSince) >= l.initGrace {
+		l.fallbackToDefaultFileLocked(now)
+		return
+	}
+	if l.pendingTimer == nil {
+		delay := l.initGrace - now.Sub(l.pendingSince)
+		if delay <= 0 {
+			delay = time.Millisecond
+		}
+		l.pendingTimer = time.AfterFunc(delay, l.onPendingGraceTimeout)
+	}
+}
+
+// onPendingGraceTimeout 是宽限到期后的兜底：仍未被 Init 时按默认配置落盘。
+func (l *Logger) onPendingGraceTimeout() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.pendingTimer = nil
+	if l.initialized || l.logFile != nil || len(l.pendingLines) == 0 {
+		return
+	}
+	cfg := l.config.Load().(*config)
+	l.fallbackToDefaultFileLocked(time.Now().In(cfg.location))
+}
+
+// fallbackToDefaultFileLocked 用当前配置（未 Init 时为默认 prefix=log）打开文件
+// 并补写暂存日志。调用方必须持有 mu 且此时 logFile 为 nil。
+func (l *Logger) fallbackToDefaultFileLocked(now time.Time) {
+	l.stopPendingTimerLocked()
+	l.pendingSince = time.Time{}
+
+	cfg := l.config.Load().(*config)
+	if err := l.rotate(now); err != nil {
+		// 打不开文件时丢弃暂存内容（控制台已输出过），避免无限占用内存。
+		fmt.Fprintf(os.Stderr, "open logfile error: %v\n", err)
+		l.pendingLines = nil
+		return
+	}
+	l.writePendingLocked()
+	if l.flushTicker == nil && cfg.flushInterval > 0 {
+		l.startFlusher()
+	}
+}
+
+// writePendingLocked 把暂存日志写入当前已打开的文件，并立即刷新一次，
+// 保证启动期日志尽快落盘。没有暂存内容时是空操作。
+func (l *Logger) writePendingLocked() {
+	if len(l.pendingLines) == 0 {
+		return
+	}
+	for _, line := range l.pendingLines {
+		if l.bufw != nil {
+			if _, err := l.bufw.WriteString(line); err != nil {
+				fmt.Fprintf(os.Stderr, "write buffer error: %v\n", err)
+				if l.logFile != nil {
+					l.logFile.WriteString(line)
+				}
+			}
+		} else if l.logFile != nil {
+			if _, err := l.logFile.WriteString(line); err != nil {
+				fmt.Fprintf(os.Stderr, "write logfile error: %v\n", err)
+			}
+		}
+	}
+	l.pendingLines = nil
+	if l.bufw != nil {
+		if err := l.bufw.Flush(); err != nil {
+			fmt.Fprintf(os.Stderr, "flush buffer error: %v\n", err)
+		}
+	}
+}
+
+// stopPendingTimerLocked 停止宽限兜底定时器。
+func (l *Logger) stopPendingTimerLocked() {
+	if l.pendingTimer != nil {
+		l.pendingTimer.Stop()
+		l.pendingTimer = nil
+	}
+}
+
+// closeFileLocked 停止刷新器并关闭当前文件，调用方必须持有 mu。
+func (l *Logger) closeFileLocked() {
+	l.stopFlusher()
+	if l.bufw != nil {
+		l.bufw.Flush()
+		l.bufw = nil
+	}
+	if l.logFile != nil {
+		if err := l.logFile.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "close old logfile error: %v\n", err)
+		}
+		l.logFile = nil
+		l.logTime = time.Time{}
+	}
+}
+
 // flushAndClose 退出前刷新缓冲区并关闭文件。
 func (l *Logger) flushAndClose() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	l.stopPendingTimerLocked()
+	// 从未 Init 且仍有暂存日志：Close 前按默认配置落盘，避免短命进程丢日志。
+	if !l.initialized && len(l.pendingLines) > 0 {
+		cfg := l.config.Load().(*config)
+		l.fallbackToDefaultFileLocked(time.Now().In(cfg.location))
+	}
+
 	l.stopFlusher()
 	if l.bufw != nil {
 		l.bufw.Flush()
@@ -783,7 +967,10 @@ func (l *Logger) cleanupOldFiles(now time.Time) {
 
 	entries, err := os.ReadDir(cfg.dir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "cleanup read dir error: %v\n", err)
+		// Init 可能在首次写日志前调用，此时目录尚不存在，无需清理也无需报错。
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "cleanup read dir error: %v\n", err)
+		}
 		return
 	}
 
@@ -864,9 +1051,13 @@ func (l *Logger) startFlusher() {
 		l.stopFlusher()
 	}
 	cfg := l.config.Load().(*config)
-	l.flushTicker = time.NewTicker(cfg.flushInterval)
-	l.flushDone = make(chan struct{})
-	go l.flushLoop()
+	ticker := time.NewTicker(cfg.flushInterval)
+	done := make(chan struct{})
+	l.flushTicker = ticker
+	l.flushDone = done
+	// 把 ticker/done 作为参数传给协程：stopFlusher 会把字段置 nil，
+	// 若协程每轮 select 都读 l.flushTicker.C，就会在停止后空指针 panic。
+	go l.flushLoop(ticker, done)
 }
 
 func (l *Logger) stopFlusher() {
@@ -878,10 +1069,10 @@ func (l *Logger) stopFlusher() {
 	}
 }
 
-func (l *Logger) flushLoop() {
+func (l *Logger) flushLoop(ticker *time.Ticker, done <-chan struct{}) {
 	for {
 		select {
-		case <-l.flushTicker.C:
+		case <-ticker.C:
 			l.mu.Lock()
 			if l.bufw != nil {
 				if err := l.bufw.Flush(); err != nil {
@@ -889,7 +1080,7 @@ func (l *Logger) flushLoop() {
 				}
 			}
 			l.mu.Unlock()
-		case <-l.flushDone:
+		case <-done:
 			return
 		}
 	}
