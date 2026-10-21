@@ -730,6 +730,11 @@ func (c *WSClient) auth(conn *websocket.Conn, timeout time.Duration) error {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return errors.New("auth timeout")
 		}
+		// 服务端可能在发送 AuthResponse 前直接以 1008 关闭连接（旧实现或中间
+		// 代理均可能如此），这属于明确的认证拒绝，不能当作临时故障无限重连。
+		if websocket.CloseStatus(err) == websocket.StatusPolicyViolation {
+			return fmt.Errorf("%w: connection closed by server", ErrAuthRejected)
+		}
 		return fmt.Errorf("read auth response failed: %w", err)
 	}
 

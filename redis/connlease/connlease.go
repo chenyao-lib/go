@@ -110,9 +110,21 @@ return {old_server, old_connection, tostring(epoch)}
 `)
 
 // renewScript 只允许当前 connection_id 续租，旧连接不能延长新连接的租约。
+// 同时刷新 epoch key 的过期时间：epoch 只在 acquire 时递增，若仅在 acquire
+// 续 TTL，长连接存活超过 epoch TTL 后 key 过期，下一次 INCR 会从 0 重新开始，
+// fencing token 回退。epoch key 意外缺失时从 owner hash 中恢复当前值，保证
+// 同一 owner 生命周期内 epoch 单调不减。
 var renewScript = redis.NewScript(`
 if redis.call("HGET", KEYS[1], "connection_id") == ARGV[1] then
-	return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+	if redis.call("EXISTS", KEYS[2]) == 0 then
+		local epoch = redis.call("HGET", KEYS[1], "epoch")
+		if epoch then
+			redis.call("SET", KEYS[2], epoch)
+		end
+	end
+	redis.call("PEXPIRE", KEYS[1], ARGV[2])
+	redis.call("PEXPIRE", KEYS[2], ARGV[3])
+	return 1
 end
 return 0
 `)
@@ -554,9 +566,10 @@ func (m *Manager) renewConnections() {
 				renewed, err := renewScript.Run(
 					ctx,
 					m.client,
-					[]string{m.ownerKey(entry.key)},
+					[]string{m.ownerKey(entry.key), m.epochKey(entry.key)},
 					entry.connectionID,
 					m.sessionTTL.Milliseconds(),
+					m.sessionTTL.Milliseconds()*epochKeyTTLFactor,
 				).Int()
 				cancel()
 				if err != nil {
