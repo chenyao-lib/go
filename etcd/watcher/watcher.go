@@ -24,8 +24,9 @@
 //
 // NewWatcher 默认使用轮询；WithRoundRobin 可显式选择轮询，WithHashRing 的参数
 // 是每个真实节点的虚拟节点数，WithStrategy 可安装自定义并发安全策略。Start
-// 会先建立 etcd 保活上下文、加载已有节点，再启动后台 watch。必须在成功 Start
-// 后调用 GetNode，并在退出时 Close。
+// 会先加载已有节点，再启动后台 watch。必须在成功 Start 后调用 GetNode，并在
+// 退出时 Close。leaseTTL 仅为兼容旧签名保留，watcher 不注册服务，也不会创建
+// 租约（旧实现创建的租约从未绑定任何 key，只会产生无意义的保活开销）。
 //
 // # etcd 数据格式
 //
@@ -83,7 +84,7 @@ type ServerInfo struct {
 type NodeWatcher struct {
 	cli       *clientv3.Client
 	prefix    string
-	leaseTTL  int
+	leaseTTL  int // 仅为兼容 NewWatcher 签名保留，watcher 不创建租约
 	strategy  SelectStrategy
 	ctx       context.Context // 生命周期 context，仅 Close 时取消（与租约解耦）
 	cancel    context.CancelFunc
@@ -144,9 +145,8 @@ func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOptio
 }
 
 // Start 启动节点发现：
-//  1. 创建租约保活（watcher 本身不注册服务，租约仅为兼容保留；失败不影响 watch）
-//  2. 加载已有 node
-//  3. 启动 watch（断线自动重连 + 全量重新同步）
+//  1. 加载已有 node
+//  2. 启动 watch（断线自动重连 + 全量重新同步）
 func (nw *NodeWatcher) Start() error {
 	var startErr error
 	// startOnce 防重入：重复 Start 会覆盖 ctx/cancel 并启动多个 watch 协程。
@@ -156,10 +156,6 @@ func (nw *NodeWatcher) Start() error {
 		// keepalive 停止时会 cancel 掉 watch，节点列表从此冻结（错过的增删
 		// 永远补不上，哈希环里出现指向已死实例的僵尸节点）。现已解耦。
 		nw.ctx, nw.cancel = context.WithCancel(context.Background())
-
-		if _, _, err := createEtcdLease(nw.cli, nw.leaseTTL); err != nil {
-			log.Warn("创建保活租约失败(不影响 watch): prefix=%s, ttl=%ds, err=%v", nw.prefix, nw.leaseTTL, err)
-		}
 
 		// 2. 加载已有 node（2s 超时，失败立即退出）
 		getCtx, getCancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -256,10 +252,11 @@ func (nw *NodeWatcher) watchNodes() {
 		// channel 缓冲补放，配合 AddNode 去重 / RemoveNode 幂等保证最终一致。
 		// 若反过来先同步后建 watch，两步之间的事件会永久丢失。首轮也不例外
 		// （Start 的初始 loadNodes 与这里建 watch 之间同样存在窗口）。
+		// 同步失败时保留旧节点列表：先 Reset 再请求会在 etcd 短暂不可用时
+		// 把策略清空，造成重连窗口内所有 GetNode 返回空、业务直接拒绝服务。
 		syncCtx, syncCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		nw.strategy.Reset()
 		if err := nw.loadNodes(syncCtx); err != nil {
-			log.Error("watch 节点全量同步失败(断线后将继续重试): prefix=%s, err=%v", nw.prefix, err)
+			log.Error("watch 节点全量同步失败(保留现有节点，断线后将继续重试): prefix=%s, err=%v", nw.prefix, err)
 		}
 		syncCancel()
 
@@ -310,55 +307,42 @@ func (nw *NodeWatcher) applyEvents(events []*clientv3.Event) {
 	}
 }
 
-// createEtcdLease 创建租约并持续 keepalive，返回可取消的 context
-func createEtcdLease(cli *clientv3.Client, leaseTTL int) (context.Context, context.CancelFunc, error) {
-	log.Info("creating etcd lease (TTL %ds)...", leaseTTL)
-
-	leaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	lease, err := cli.Grant(leaseCtx, int64(leaseTTL))
-	cancel()
-	if err != nil {
-		return nil, nil, errors.New("etcd grant lease error: " + err.Error())
-	}
-	log.Info("etcd lease granted: %d", lease.ID)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	keepaliveCh, err := cli.KeepAlive(ctx, lease.ID)
-	if err != nil {
-		cancel()
-		return nil, nil, errors.New("etcd keepalive error: " + err.Error())
-	}
-
-	go func() {
-		// 消费 keepalive 通道防止阻塞，etcd client 内部自动续约
-		for range keepaliveCh {
-		}
-		log.Error("etcd keepalive stopped")
-		cancel()
-	}()
-
-	return ctx, cancel, nil
-}
-
-// loadNodes 从 etcd 加载已有 node 并写入策略
-func (nw *NodeWatcher) loadNodes(ctx context.Context) error {
+// fetchNodes 从 etcd 拉取 prefix 下的全部 node 地址。
+// 只有请求成功才返回结果；失败时调用方应保留策略中的现有节点。
+func (nw *NodeWatcher) fetchNodes(ctx context.Context) ([]string, error) {
 	log.Info("loading existing nodes from etcd...")
 
 	resp, err := nw.cli.Get(ctx, nw.prefix, clientv3.WithPrefix())
 	if err != nil {
-		return errors.New("etcd get nodes error: " + err.Error())
+		return nil, errors.New("etcd get nodes error: " + err.Error())
 	}
 
+	nodes := make([]string, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
 		addr := parseNodeAddr(kv.Value)
 		if addr != "" {
-			nw.strategy.AddNode(addr)
-			log.Info("Loaded node: %s", addr)
+			nodes = append(nodes, addr)
 		} else {
 			log.Error("parse node addr failed, key=%s value=%s", string(kv.Key), string(kv.Value))
 		}
 	}
-	log.Info("loaded %d nodes", len(resp.Kvs))
+	return nodes, nil
+}
+
+// loadNodes 从 etcd 全量同步 node 到策略。
+// 先请求成功再 Reset + 重建，避免 etcd 短暂不可用时把已有节点清空。
+func (nw *NodeWatcher) loadNodes(ctx context.Context) error {
+	nodes, err := nw.fetchNodes(ctx)
+	if err != nil {
+		return err
+	}
+
+	nw.strategy.Reset()
+	for _, addr := range nodes {
+		nw.strategy.AddNode(addr)
+		log.Info("Loaded node: %s", addr)
+	}
+	log.Info("loaded %d nodes", len(nodes))
 	return nil
 }
 

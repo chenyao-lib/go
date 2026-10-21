@@ -19,6 +19,9 @@
 //	body, err := token.DecodePayload(tok)    // 不验签拆载荷(仅供路由参考等非安全场景)
 //
 // LoginToken 的字段名(json tag)是各业务系统约定的标准载荷结构，勿随意改动。
+//
+// Issue、Decode 和 Parse 在 secret 为空时直接失败，避免用空密钥签发可伪造的
+// 令牌；Issue 只修改副本，不会改写调用方传入的 LoginToken。
 package token
 
 import (
@@ -90,6 +93,9 @@ func DecodePayload(tokenStr string) ([]byte, error) {
 
 // Decode 验签并返回载荷字节
 func Decode(tokenStr, secret string) ([]byte, error) {
+	if secret == "" {
+		return nil, errors.New("token secret is empty")
+	}
 	parts := strings.SplitN(tokenStr, ".", 2)
 	if len(parts) != 2 {
 		return nil, errors.New("invalid token format")
@@ -109,10 +115,15 @@ func Decode(tokenStr, secret string) ([]byte, error) {
 }
 
 // Issue 填充过期时间(Expire)并签发令牌。
-// LoginToken 序列化不会失败，异常时返回空串。
+// 只修改副本，不会改写调用方传入的 LoginToken；t 为 nil、secret 为空或
+// 序列化失败时返回空串。
 func Issue(t *LoginToken, ttl time.Duration, secret string) string {
-	t.Expire = time.Now().Add(ttl).Unix()
-	data, err := json.Marshal(t)
+	if t == nil || secret == "" {
+		return ""
+	}
+	issued := *t
+	issued.Expire = time.Now().Add(ttl).Unix()
+	data, err := json.Marshal(&issued)
 	if err != nil {
 		return ""
 	}

@@ -53,9 +53,13 @@
 // 字段；它只能在未连接状态设置，并且必须与服务端认证返回的 Codec 使用相同
 // 密钥和 key ID。
 //
-// 读超时、控制帧写超时、默认调用超时、单方法调用超时和处理队列容量都应在
-// Start 前配置。WaitStopSignal 是命令行程序等待 SIGINT/SIGTERM 并清理客户端
-// 的便捷入口。
+// 服务端明确拒绝认证（AuthResponse.OK=false）时 Start 会返回并永久停止；
+// 网络错误、读写超时、响应格式错误等临时故障会按指数退避继续重试。
+//
+// 心跳间隔、控制帧写超时、默认调用超时、单方法调用超时和处理队列容量都应在
+// Start 前配置。SetReadDeadline 仅为兼容保留，coder/websocket 不支持单连接
+// 读超时，调用不会生效。WaitStopSignal 是命令行程序等待 SIGINT/SIGTERM 并
+// 清理客户端的便捷入口。
 package clt
 
 import (
@@ -90,6 +94,12 @@ type RPCMessage struct {
 }
 
 const defaultHandlerQueue = 256
+
+const defaultHeartbeatInterval = 20 * time.Second
+
+// ErrAuthRejected 表示服务端明确拒绝了认证信息（AuthResponse.OK=false）。
+// 该错误不可重试；网络错误、超时和响应格式错误不属于此错误，Start 会继续重试。
+var ErrAuthRejected = errors.New("authentication rejected by server")
 
 type AuthPayloadFunc func(c *WSClient) (any, error)
 
@@ -200,7 +210,7 @@ func (c *WSClient) readPump(ctx context.Context, conn *websocket.Conn, cancel co
 }
 
 func (c *WSClient) writePump(ctx context.Context, conn *websocket.Conn, wg *sync.WaitGroup) {
-	ticker := time.NewTicker(time.Duration(c.heartbeatInterval.Load()))
+	ticker := time.NewTicker(c.heartbeatPeriod())
 	defer func() {
 		ticker.Stop()
 		conn.CloseNow()
@@ -454,8 +464,21 @@ func (c *WSClient) meResponse(session string, data any, err error) {
 	}
 }
 
+// nextSession 生成客户端发起的 RPC 会话 ID。
+// 加 "clt-" 前缀与服务端前缀隔离：两端 nextSession 都是从 1 开始的自增数字，
+// 不加前缀时客户端请求 session 可能与服务端请求 session 相同，导致
+// otherResponse 把对方的请求误判为响应并吞掉。
 func (c *WSClient) nextSession() string {
-	return strconv.FormatInt(atomic.AddInt64(&c.sessionSeed, 1), 10)
+	return "clt-" + strconv.FormatInt(atomic.AddInt64(&c.sessionSeed, 1), 10)
+}
+
+// heartbeatPeriod 返回心跳间隔；非法值回退默认值，避免 time.NewTicker panic。
+func (c *WSClient) heartbeatPeriod() time.Duration {
+	period := time.Duration(c.heartbeatInterval.Load())
+	if period <= 0 {
+		return defaultHeartbeatInterval
+	}
+	return period
 }
 
 // NewClient 初始化客户端（在这里绑定 Context）
@@ -486,7 +509,7 @@ func NewClient(ctx context.Context, host string, clientType string, clientId str
 	c.HandlerCh = make(chan RPCMessage, c.handlerQueueCap())
 	c.writeTimeout.Store(int64(5 * time.Second))
 	c.defaultCallTimeout.Store(int64(5 * time.Second))
-	c.heartbeatInterval.Store(int64(20 * time.Second))
+	c.heartbeatInterval.Store(int64(defaultHeartbeatInterval))
 	c.readDeadline.Store(int64(30 * time.Second))
 	c.controlWriteTimeout.Store(int64(2 * time.Second))
 	c.authPayload = defaultAuthPayload
@@ -587,14 +610,21 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 			continue
 		}
 
-		// 设置读限制和读超时
+		// 设置读限制
 		conn.SetReadLimit(c.readLimit)
 
 		if err := c.auth(conn, time.Duration(c.writeTimeout.Load())); err != nil {
-			log.Error("认证失败: %v，客户端彻底停止", err)
 			conn.CloseNow()
-			c.Cancel()
-			return
+			if errors.Is(err, ErrAuthRejected) {
+				log.Error("认证被服务端拒绝: %v，客户端彻底停止", err)
+				c.Cancel()
+				return
+			}
+			// 网络抖动、认证响应超时、响应格式错误等临时故障不应永久停机，
+			// 计入失败次数后按指数退避重连。
+			consecutiveFailures++
+			log.Warn("认证过程发生临时故障(将重试): %v", err)
+			continue
 		}
 
 		// 连接成功，重置失败计数
@@ -709,9 +739,9 @@ func (c *WSClient) auth(conn *websocket.Conn, timeout time.Duration) error {
 	}
 	if !resp.OK {
 		if resp.Error == "" {
-			return errors.New("auth failed")
+			return fmt.Errorf("%w: auth failed", ErrAuthRejected)
 		}
-		return errors.New(resp.Error)
+		return fmt.Errorf("%w: %s", ErrAuthRejected, resp.Error)
 	}
 	return nil
 }
@@ -742,9 +772,22 @@ func (c *WSClient) WaitStopSignal() {
 	log.Info("资源清理完毕")
 }
 
+// SetReadDeadline 已废弃且不生效：coder/websocket 不支持单连接读超时，
+// 读操作只受连接 context 约束。保留该方法仅为兼容历史调用。
 func (c *WSClient) SetReadDeadline(d time.Duration) {
 	c.readDeadline.Store(int64(d))
 }
+
+// SetHeartbeatInterval 设置 Ping 心跳发送间隔，应在 Start 前调用。
+// 每次建立连接时按当前值创建心跳 ticker，非正值会被忽略。
+func (c *WSClient) SetHeartbeatInterval(d time.Duration) {
+	if d <= 0 {
+		log.Warn("忽略非法心跳间隔: %v", d)
+		return
+	}
+	c.heartbeatInterval.Store(int64(d))
+}
+
 func (c *WSClient) SetControlWriteTimeout(d time.Duration) {
 	c.controlWriteTimeout.Store(int64(d))
 }

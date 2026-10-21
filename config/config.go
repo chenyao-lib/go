@@ -55,6 +55,9 @@
 // 字段名。嵌套字段用点连接，例如 server.addr。Loader.OnChange 只作用于该
 // Loader；包级 OnChange 作用于所有 Loader。回调在独立 goroutine 中执行，
 // 调用方应自行保证共享状态的并发安全。
+//
+// 回调只针对叶子字段：结构体发生变化时会递归收敛为 server.addr 这类具体
+// 路径，不会同时再上报 server 父路径。
 package config
 
 import (
@@ -587,12 +590,15 @@ func diffConfig(oldConf, newConf any, prefix string, emit func(path string, oldV
 			continue
 		}
 
-		logChange(path, v1, v2)
-		emit(path, valueOf(v1), valueOf(v2))
-
+		// 结构体字段继续下钻后再上报，避免父路径和子路径各触发一次回调
+		// （旧实现先 emit 父路径再递归，调用方会收到语义重复的通知）。
 		if canRecurse(v1, v2) {
 			diffConfig(valueOf(v1), valueOf(v2), path, emit)
+			continue
 		}
+
+		logChange(path, v1, v2)
+		emit(path, valueOf(v1), valueOf(v2))
 	}
 }
 

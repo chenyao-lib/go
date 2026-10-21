@@ -40,7 +40,8 @@
 //	}
 //
 // Validate 只检查本地 active 状态，不会在消息热路径访问 Redis。Pub/Sub 通知
-// 负责快速失效，后台续租负责处理漏通知和 Redis 所有权变化。Handle.Active
+// 负责快速失效，后台续租负责处理漏通知和 Redis 所有权变化。Redis 瞬时不可用时
+// 单次续租失败不会立刻踢线，连续失败达到内部阈值后才关闭连接。Handle.Active
 // 可用于快速观察，但需要错误语义时应使用 Validate。
 //
 // # 释放和 fencing
@@ -76,6 +77,14 @@ const (
 	defaultSessionTTL    = 30 * time.Second
 	defaultRenewInterval = 10 * time.Second
 	redisCallTimeout     = 2 * time.Second
+	// epochKeyTTLFactor 控制 epoch key 的过期时间倍数。
+	// epoch key 只增不减会永久占用内存，这里按 session TTL 的 30 倍过期：
+	// 远大于任何正常会话存活时间，又能让空闲 key 最终被 Redis 回收。
+	epochKeyTTLFactor = 30
+	// maxRenewFailures 是续租连续失败阈值。
+	// Redis 短暂抖动时单次失败不代表所有权丢失，连续多次失败才关闭连接，
+	// 避免网络瞬断把所有在线连接全部踢掉。
+	maxRenewFailures = 3
 )
 
 var (
@@ -96,6 +105,7 @@ redis.call("HSET", KEYS[1],
 	"connection_id", ARGV[2],
 	"epoch", epoch)
 redis.call("PEXPIRE", KEYS[1], ARGV[3])
+redis.call("PEXPIRE", KEYS[2], ARGV[4])
 return {old_server, old_connection, tostring(epoch)}
 `)
 
@@ -154,8 +164,11 @@ type Handle struct {
 	close        func(reason string)
 	// active 是消息热路径的本地判断依据，避免每条消息访问 Redis。
 	// PubSub 踢出或续租失败时必须先置为 false，再关闭底层连接。
-	active    atomic.Bool
-	closeOnce sync.Once
+	active atomic.Bool
+	// renewFailures 记录连续续租失败次数，成功一次即清零。
+	// 只有达到阈值才关闭连接，避免 Redis 瞬时抖动导致全量踢线。
+	renewFailures atomic.Int32
+	closeOnce     sync.Once
 }
 
 // Key 返回注册该连接时使用的会话 key。
@@ -244,7 +257,9 @@ func Open(ctx context.Context, cfg Config) (*Manager, error) {
 		cancel:         cancel,
 		byConnectionID: make(map[string]*Handle),
 	}
-	manager.pubsub = client.Subscribe(ctx, manager.kickChannel())
+	// 订阅必须挂在 managerCtx 上而不是调用方 ctx：Open 的 ctx 通常是启动期
+	// 一次性 context，提前取消后订阅会静默断开，踢线通知从此失效。
+	manager.pubsub = client.Subscribe(managerCtx, manager.kickChannel())
 	if _, err := manager.pubsub.Receive(ctx); err != nil {
 		cancel()
 		_ = manager.pubsub.Close()
@@ -468,6 +483,7 @@ func (m *Manager) acquire(
 		m.serverAddr,
 		connectionID,
 		m.sessionTTL.Milliseconds(),
+		m.sessionTTL.Milliseconds()*epochKeyTTLFactor,
 	).Slice()
 	if err != nil {
 		return previousOwner{}, 0, fmt.Errorf("acquire connection ownership: %w", err)
@@ -544,10 +560,23 @@ func (m *Manager) renewConnections() {
 				).Int()
 				cancel()
 				if err != nil {
-					// Redis 不可用时采用 fail-closed，避免无法确认 owner 的连接继续处理业务。
-					m.closeConnection(entry, "connection ownership unavailable", err)
+					// Redis 不可用时不能无限信任本地状态：连续失败达到阈值后
+					// 才 fail-closed，单次抖动只记录告警并等待下一轮续租。
+					failures := entry.renewFailures.Add(1)
+					log.Warn(
+						"连接续租失败: key=%s, connection=%s, failures=%d/%d, err=%v",
+						entry.key,
+						entry.connectionID,
+						failures,
+						maxRenewFailures,
+						err,
+					)
+					if failures >= maxRenewFailures {
+						m.closeConnection(entry, "connection ownership unavailable", err)
+					}
 					continue
 				}
+				entry.renewFailures.Store(0)
 				if renewed != 1 {
 					m.closeConnection(entry, "connection replaced", nil)
 				}

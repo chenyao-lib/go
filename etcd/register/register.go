@@ -142,6 +142,11 @@ func (o *RegisterOption) setDefaults() {
 	o.AutoReRegister = !o.DisableAutoReRegister
 }
 
+// revokeTimeout 是撤销租约的超时时间。
+// Revoke(context.Background()) 在 etcd 不可达时会永久阻塞，导致 Close 卡死、
+// 自动重注册协程永久挂起，因此所有撤销操作都必须带超时。
+const revokeTimeout = 3 * time.Second
+
 // ---------------------------------------------------------------------------
 // Register - 通用 etcd 注册器
 // ---------------------------------------------------------------------------
@@ -296,10 +301,7 @@ func (r *Register) ReRegister() error {
 	}
 
 	if r.registered && r.leaseID != 0 {
-		_, err := r.client.Revoke(context.Background(), r.leaseID)
-		if err != nil {
-			log.Error("撤销旧租约失败: %v", err)
-		}
+		r.revokeLease(r.ctx)
 	}
 
 	if err := r.doRegister(); err != nil {
@@ -307,6 +309,16 @@ func (r *Register) ReRegister() error {
 		return err
 	}
 	return nil
+}
+
+// revokeLease 在限定时间内撤销当前租约，失败只记录日志。
+// 调用方需持有 r.mu。
+func (r *Register) revokeLease(ctx context.Context) {
+	revokeCtx, cancel := context.WithTimeout(ctx, revokeTimeout)
+	defer cancel()
+	if _, err := r.client.Revoke(revokeCtx, r.leaseID); err != nil {
+		log.Error("撤销租约失败: lease=%d, err=%v", r.leaseID, err)
+	}
 }
 
 // IsAlive 返回当前注册是否有效。
@@ -333,10 +345,8 @@ func (r *Register) Close() error {
 	r.cancel()
 
 	if r.registered && r.leaseID != 0 {
-		_, err := r.client.Revoke(context.Background(), r.leaseID)
-		if err != nil {
-			log.Error("撤销租约失败: %v", err)
-		}
+		// r.ctx 已在上面取消，撤销使用独立的后台 context。
+		r.revokeLease(context.Background())
 		r.registered = false
 	}
 

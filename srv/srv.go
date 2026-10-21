@@ -391,8 +391,12 @@ func (c *Client) meResponse(session string, data any, err error) {
 	c.sendMu.RUnlock()
 }
 
+// nextSession 生成服务端发起的 RPC 会话 ID。
+// 加 "srv-" 前缀与客户端前缀隔离：两端 nextSession 都是从 1 开始的自增数字，
+// 不加前缀时服务端请求 session 可能与客户端请求 session 相同，导致
+// otherResponse 把对方的请求误判为响应并吞掉。
 func (c *Client) nextSession() string {
-	return strconv.FormatInt(atomic.AddInt64(&c.sessionSeed, 1), 10)
+	return "srv-" + strconv.FormatInt(atomic.AddInt64(&c.sessionSeed, 1), 10)
 }
 
 // --- 读写泵 (Pumps) ---
@@ -517,6 +521,9 @@ func NewServer(wsPort string) (s *WsServer) {
 		Unregister: make(chan *Client),
 	}
 	s.connMgr = mgr
+	// 默认 InsecureSkipVerify=true 会接受任意 Origin；保持兼容但明确提示，
+	// 避免对外服务在无感知的情况下被任意站点跨域连接。
+	log.Warn("WebSocket Origin 白名单为空，默认允许所有来源；对外服务请调用 SetOriginPatterns: addr=%s", wsPort)
 	return s
 }
 

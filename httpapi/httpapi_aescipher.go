@@ -14,6 +14,10 @@ import (
 
 // AESCipher implements Encryptor with AES-CBC and PKCS#7 padding. Ciphertext is
 // encoded as base64 so it can be safely transported in a JSON or form field.
+//
+// AES-CBC 只提供机密性，不提供完整性：密文被篡改时解密可能成功并返回错误
+// 明文。该实现仅用于兼容既有线协议；新协议应使用 AES-GCM 等带认证的加密，
+// 无法更换加密方式时应设置 HttpClient.VerifyResponse 额外校验响应签名。
 type AESCipher struct {
 	base64Key string
 }

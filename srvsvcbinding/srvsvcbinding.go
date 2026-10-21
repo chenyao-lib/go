@@ -114,9 +114,33 @@ func WithMiddleware(middlewares ...Middleware) Option {
 
 // connectionState 保存单个客户端已启动的 Service 和已完成 ready 的中间件。
 // readyMiddlewares 只记录成功项，因此初始化中途失败时可以做精确回滚。
+// ready 流程（写入 service/readyMiddlewares）与消息分发（读取）在不同协程
+// 并发执行，所有读写都必须经过 mu。
 type connectionState struct {
+	mu               sync.RWMutex
 	service          svc.Instance
 	readyMiddlewares []Middleware
+}
+
+// addReadyMiddleware 记录一个已成功 ready 的中间件。
+func (s *connectionState) addReadyMiddleware(middleware Middleware) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readyMiddlewares = append(s.readyMiddlewares, middleware)
+}
+
+// setService 在 Service 启动成功后写入实例。
+func (s *connectionState) setService(instance svc.Instance) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.service = instance
+}
+
+// snapshot 返回当前 Service 和 ready 中间件副本，供消息分发和关闭流程使用。
+func (s *connectionState) snapshot() (svc.Instance, []Middleware) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.service, append([]Middleware(nil), s.readyMiddlewares...)
 }
 
 // ClientServiceBinding 将每个 WebSocket 客户端绑定到独立的业务 Service，
@@ -168,7 +192,7 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 			c.CloseWithReason(1011, "prepare connection failed")
 			return
 		}
-		state.readyMiddlewares = append(state.readyMiddlewares, middleware)
+		state.addReadyMiddleware(middleware)
 	}
 
 	connSvc := b.svcFactory(c)
@@ -196,7 +220,7 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 		c.CloseWithReason(1011, "start connection service failed")
 		return
 	}
-	state.service = connSvc
+	state.setService(connSvc)
 	log.Info(
 		"连接服务启动成功: client_type=%s, client_id=%s, service=%s",
 		c.Type,
@@ -230,7 +254,8 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 		return nil, err
 	}
 	state := value.(*connectionState)
-	if state.service == nil {
+	connSvc, readyMiddlewares := state.snapshot()
+	if connSvc == nil {
 		err := errors.New("connection service is not ready")
 		log.Warn(
 			"消息分发失败，连接服务未就绪: client_type=%s, client_id=%s, method=%s, session=%s",
@@ -243,7 +268,7 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 	}
 
 	ctx := context.Background()
-	for _, middleware := range state.readyMiddlewares {
+	for _, middleware := range readyMiddlewares {
 		if err := middleware.BeforeMessage(ctx, c, msg); err != nil {
 			log.Warn(
 				"消息被中间件拒绝: client_type=%s, client_id=%s, method=%s, session=%s, err=%v",
@@ -258,24 +283,25 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 	}
 
 	if msg.Session != "" {
-		return state.service.RawCall(ctx, msg.Method, msg.Data)
+		return connSvc.RawCall(ctx, msg.Method, msg.Data)
 	}
-	return nil, state.service.RawSend(ctx, msg.Method, msg.Data)
+	return nil, connSvc.RawSend(ctx, msg.Method, msg.Data)
 }
 
 // stopConnection 先停止业务 Service，再逆序清理已经 ready 的中间件。
 // 逆序与初始化顺序对称，既用于正常断线，也用于 ready/start 失败时回滚。
 func (b *ClientServiceBinding) stopConnection(ctx context.Context, state *connectionState, c *srv.Client) {
-	if state.service != nil {
-		state.service.Stop()
+	connSvc, readyMiddlewares := state.snapshot()
+	if connSvc != nil {
+		connSvc.Stop()
 		log.Info(
 			"连接服务已停止: client_type=%s, client_id=%s, service=%s",
 			c.Type,
 			c.ID,
-			state.service.Name(),
+			connSvc.Name(),
 		)
 	}
-	for idx := len(state.readyMiddlewares) - 1; idx >= 0; idx-- {
-		state.readyMiddlewares[idx].OnClientClose(ctx, c)
+	for idx := len(readyMiddlewares) - 1; idx >= 0; idx-- {
+		readyMiddlewares[idx].OnClientClose(ctx, c)
 	}
 }

@@ -41,13 +41,17 @@
 //
 // 也可实现 Encryptor 并传给 NewHttpClient。nil Encryptor 表示 data 字段直接
 // 承载明文 JSON 字符串。内置实现用于兼容 AES-CBC+PKCS#7 协议；新协议若需要
-// 防篡改能力，应优先使用带认证的加密设计。
+// 防篡改能力，应优先使用带认证的加密设计。AES-CBC 本身不校验完整性，无法
+// 发现密文被篡改；旧协议无法更换加密方式时，应设置 HttpClient.VerifyResponse
+// 在解密前校验响应 timestamp/signature。
 //
 // # 表单接口
 //
 // CallFormMap 将业务请求编码到 application/x-www-form-urlencoded 的 __input
 // 字段，并将成功响应解析为 map[string]any。RequestForm 发送 multipart/form-data
 // 字符串字段并返回原始响应体。两者都会把非 200 HTTP 状态作为错误返回。
+//
+// 所有请求的响应体读取上限为 8 MiB，超出时返回错误，避免异常服务端耗尽内存。
 package httpapi
 
 import (
@@ -65,9 +69,32 @@ import (
 	"github.com/chenyao-lib/go/log"
 )
 
+// maxResponseBytes 是单次响应体读取上限，防止异常或恶意服务端返回超大响应
+// 导致客户端内存暴涨。
+const maxResponseBytes = 8 << 20
+
 type HttpClient struct {
 	httpClient *http.Client
 	encryptor  Encryptor
+
+	// VerifyResponse 非 nil 时，在返回业务数据前校验响应的 data、timestamp 和
+	// signature；返回错误会立即终止本次调用。内置 AES-CBC 不提供完整性校验，
+	// 旧协议无法替换加密方式时可用它发现密文篡改。
+	VerifyResponse func(data string, ts int64, sig string) error
+}
+
+// HTTPStatusError 表示服务端返回了非 200 HTTP 状态码。
+// 响应体可能已被解析为业务信封，Body 保留原始字节便于诊断。
+type HTTPStatusError struct {
+	StatusCode int
+	Body       []byte
+}
+
+func (e *HTTPStatusError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("unexpected http status: %d", e.StatusCode)
 }
 
 // Encryptor converts request bytes to a transport-safe string and restores
@@ -156,6 +183,9 @@ func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) (cal
 		if apiResp == nil || apiResp.Data == "" {
 			return err
 		}
+		if verifyErr := c.verifyResponse(apiResp); verifyErr != nil {
+			return verifyErr
+		}
 		if decErr := c.decryptData(apiResp.Data, out); decErr != nil {
 			return err
 		}
@@ -170,8 +200,22 @@ func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) (cal
 		}
 		return &APIError{Code: apiResp.Code, Msg: apiResp.Msg}
 	}
+	if err := c.verifyResponse(apiResp); err != nil {
+		return err
+	}
 	if err := c.decryptData(apiResp.Data, out); err != nil {
 		return err
+	}
+	return nil
+}
+
+// verifyResponse 在解密前校验响应签名；未配置 VerifyResponse 时视为通过。
+func (c *HttpClient) verifyResponse(resp *apiResponse) error {
+	if c == nil || c.VerifyResponse == nil || resp == nil {
+		return nil
+	}
+	if err := c.VerifyResponse(resp.Data, resp.Timestamp, resp.Signature); err != nil {
+		return fmt.Errorf("verify API response signature: %w", err)
 	}
 	return nil
 }
@@ -266,12 +310,12 @@ func (c *HttpClient) requestURLEncoded(reqURL string, fields map[string]string) 
 		return nil, fmt.Errorf("send urlencoded request: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, readErr := io.ReadAll(resp.Body)
+	respBody, readErr := readResponseBody(resp.Body)
 	if readErr != nil {
 		return nil, fmt.Errorf("read urlencoded response: %w", readErr)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return respBody, fmt.Errorf("unexpected http status: %d", resp.StatusCode)
+		return respBody, &HTTPStatusError{StatusCode: resp.StatusCode, Body: respBody}
 	}
 	return respBody, nil
 }
@@ -297,7 +341,12 @@ func (c *HttpClient) startRequest(reqURL string, reqMethod string, reqBody any) 
 		if jsonErr := json.Unmarshal(respBytes, &respObj); jsonErr != nil {
 			return nil, err
 		}
-		return &respObj, errors.New(respObj.Msg)
+		// 保留原始错误（含 *HTTPStatusError 的状态码），只补充服务端 msg，
+		// 避免把状态码信息替换成纯业务文案后无法区分 401/500。
+		if respObj.Msg != "" {
+			return &respObj, fmt.Errorf("%w: %s", err, respObj.Msg)
+		}
+		return &respObj, err
 	}
 	var respObj apiResponse
 	if err := json.Unmarshal(respBytes, &respObj); err != nil {
@@ -321,12 +370,12 @@ func (c *HttpClient) requestJSON(reqURL string, reqMethod string, reqBody any) (
 		return nil, fmt.Errorf("send request: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, readErr := io.ReadAll(resp.Body)
+	respBody, readErr := readResponseBody(resp.Body)
 	if readErr != nil {
 		return nil, fmt.Errorf("read response: %w", readErr)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return respBody, fmt.Errorf("unexpected http status: %d", resp.StatusCode)
+		return respBody, &HTTPStatusError{StatusCode: resp.StatusCode, Body: respBody}
 	}
 	return respBody, nil
 }
@@ -362,12 +411,25 @@ func (c *HttpClient) RequestForm(reqURL string, fields map[string]string) (resul
 		return nil, fmt.Errorf("send form request: %w", err)
 	}
 	defer resp.Body.Close()
-	respBody, readErr := io.ReadAll(resp.Body)
+	respBody, readErr := readResponseBody(resp.Body)
 	if readErr != nil {
 		return nil, fmt.Errorf("read form response: %w", readErr)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return respBody, fmt.Errorf("unexpected http status: %d", resp.StatusCode)
+		return respBody, &HTTPStatusError{StatusCode: resp.StatusCode, Body: respBody}
 	}
 	return respBody, nil
+}
+
+// readResponseBody 读取响应体，超过 maxResponseBytes 时返回错误，
+// 而不是把超大响应读进内存。
+func readResponseBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxResponseBytes {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxResponseBytes)
+	}
+	return data, nil
 }
