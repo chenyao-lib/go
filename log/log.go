@@ -12,7 +12,7 @@
 //   - 最新文件入口：每次打开或滚动日志后，在日志目录维护 <prefix>_latest.log
 //     硬链接指向当前文件，可用固定路径查看最新日志（跟踪请用 tail -F）。
 //     文件系统不支持硬链接时只告警一次，不影响日志写入；异常退出遗留的
-//     <prefix>_latest.log.*.tmp 会在下次滚动时按时间清理。
+//     <prefix>_latest.log.*.tmp 会在下次滚动时立即清理。
 //
 // # 基本用法
 //
@@ -87,11 +87,6 @@ const (
 	// 设为 0 表示关闭缓冲：Init 前的日志尽快按默认配置落盘（后台异步处理
 	// 仍可能与 Init 竞争，若 Init 更早生效则直接写入 Init 配置的文件）。
 	initGraceEnv = "LOG_INIT_GRACE_MS"
-
-	// latestTmpMaxAge 是 latest 链接临时文件的最长保留时间。
-	// 正常替换在微秒级完成，超过该时间仍未改名的 .tmp 只可能是异常退出遗留，
-	// 由滚动时的清理逻辑删除。
-	latestTmpMaxAge = 10 * time.Minute
 )
 
 // config 包含所有可动态调整的配置参数，通过 atomic.Value 原子存储指针，实现无锁读取。
@@ -905,7 +900,7 @@ func (l *Logger) rotate(t time.Time) error {
 	// 建链特权，硬链接同目录、同卷即可，普通账户可用；不支持硬链接的文件系统
 	// 只告警，不影响日志写入。
 	l.relinkLatestLocked(cfg, fileName)
-	l.sweepLatestTmpLocked(cfg, t)
+	l.sweepLatestTmpLocked(cfg)
 
 	l.cleanupOldFiles(t)
 	return nil
@@ -946,9 +941,13 @@ func (l *Logger) relinkLatestLocked(cfg *config, fileName string) {
 
 // sweepLatestTmpLocked 清理异常退出遗留的 latest 链接临时文件。
 // 兼容旧版本的固定名 <prefix>_latest.log.tmp 和新版本的
-// <prefix>_latest.log.<pid>-<纳秒>.tmp；只删除超过 latestTmpMaxAge 的文件，
-// 避免误删其它进程正在创建的临时链接。调用方必须持有 mu。
-func (l *Logger) sweepLatestTmpLocked(cfg *config, now time.Time) {
+// <prefix>_latest.log.<pid>-<纳秒>.tmp。
+//
+// 不能按 mtime 判断新旧：遗留的 .tmp 是指向当前日志的硬链接，与日志共享
+// inode，日志每写一行它的 mtime 就变成"刚刚"，按时间过滤永远清不掉。
+// 而本进程创建到改名的窗口只有微秒级，且全程持有 mu，扫描时不会看到自己
+// 的临时文件，因此这里无条件删除所有匹配项。调用方必须持有 mu。
+func (l *Logger) sweepLatestTmpLocked(cfg *config) {
 	entries, err := os.ReadDir(cfg.dir)
 	if err != nil {
 		return
@@ -960,13 +959,6 @@ func (l *Logger) sweepLatestTmpLocked(cfg *config, now time.Time) {
 		}
 		name := entry.Name()
 		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".tmp") {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		if now.Sub(info.ModTime()) < latestTmpMaxAge {
 			continue
 		}
 		if err := os.Remove(filepath.Join(cfg.dir, name)); err != nil {
