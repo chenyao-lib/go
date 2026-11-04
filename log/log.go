@@ -9,6 +9,9 @@
 //   - 并发安全：所有公开函数均可安全地在多个 goroutine 中同时调用。
 //   - 动态配置：可在运行时调整级别、保留策略、缓冲参数等，无需重启。
 //   - 优雅关闭：Close 会等待所有已入队日志写入完成，确保数据不丢失。
+//   - 最新文件入口：每次打开或滚动日志后，在日志目录维护 <prefix>_latest.log
+//     硬链接指向当前文件，可用固定路径查看最新日志（跟踪请用 tail -F）。
+//     文件系统不支持硬链接时只告警一次，不影响日志写入。
 //
 // # 基本用法
 //
@@ -106,12 +109,13 @@ type Logger struct {
 	config atomic.Value // 存储 *config，所有读配置的地方均通过 Load 获取
 
 	// 以下字段仅在后台协程中访问，或受 mu 保护
-	logFile     *os.File
-	logTime     time.Time
-	bufw        *bufio.Writer
-	flushTicker *time.Ticker
-	flushDone   chan struct{}
-	reopen      bool // 标记是否需要重新打开文件（配置变更时置 true）
+	logFile      *os.File
+	logTime      time.Time
+	bufw         *bufio.Writer
+	flushTicker  *time.Ticker
+	flushDone    chan struct{}
+	reopen       bool // 标记是否需要重新打开文件（配置变更时置 true）
+	latestWarned bool // 最近一次维护 latest 链接失败是否已告警，成功一次后重置
 
 	// Init 之前的日志缓冲，受 mu 保护。
 	// initialized 为 false 时日志只进 pendingLines 与控制台，不创建文件；
@@ -891,8 +895,46 @@ func (l *Logger) rotate(t time.Time) error {
 		l.bufw = nil
 	}
 
+	// 维护 <prefix>_latest.log 硬链接，固定指向当前文件。软链接在 Windows 需要
+	// 建链特权，硬链接同目录、同卷即可，普通账户可用；不支持硬链接的文件系统
+	// 只告警，不影响日志写入。
+	l.relinkLatestLocked(cfg, fileName)
+
 	l.cleanupOldFiles(t)
 	return nil
+}
+
+// latestLinkPath 返回固定指向当前日志文件的硬链接路径。
+func latestLinkPath(cfg *config) string {
+	return filepath.Join(cfg.dir, cfg.prefix+"_latest.log")
+}
+
+// relinkLatestLocked 把 <prefix>_latest.log 重建为指向 fileName 的硬链接。
+// 先建临时名再改名替换，替换失败时保留旧链接；失败只告警一次，避免频繁滚动时刷屏。
+// 调用方必须持有 mu。
+func (l *Logger) relinkLatestLocked(cfg *config, fileName string) {
+	linkPath := latestLinkPath(cfg)
+	tmpPath := linkPath + ".tmp"
+
+	_ = os.Remove(tmpPath)
+	if err := os.Link(fileName, tmpPath); err != nil {
+		l.warnLatestLinkLocked("create latest log link", err)
+		return
+	}
+	if err := os.Rename(tmpPath, linkPath); err != nil {
+		_ = os.Remove(tmpPath)
+		l.warnLatestLinkLocked("replace latest log link", err)
+		return
+	}
+	l.latestWarned = false
+}
+
+func (l *Logger) warnLatestLinkLocked(action string, err error) {
+	if l.latestWarned {
+		return
+	}
+	l.latestWarned = true
+	fmt.Fprintf(os.Stderr, "%s error: %v (将保留旧链接，下次滚动时重试)\n", action, err)
 }
 
 func (l *Logger) needRotate(t time.Time) bool {
