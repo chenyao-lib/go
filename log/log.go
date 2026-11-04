@@ -11,7 +11,8 @@
 //   - 优雅关闭：Close 会等待所有已入队日志写入完成，确保数据不丢失。
 //   - 最新文件入口：每次打开或滚动日志后，在日志目录维护 <prefix>_latest.log
 //     硬链接指向当前文件，可用固定路径查看最新日志（跟踪请用 tail -F）。
-//     文件系统不支持硬链接时只告警一次，不影响日志写入。
+//     文件系统不支持硬链接时只告警一次，不影响日志写入；异常退出遗留的
+//     <prefix>_latest.log.*.tmp 会在下次滚动时按时间清理。
 //
 // # 基本用法
 //
@@ -86,6 +87,11 @@ const (
 	// 设为 0 表示关闭缓冲：Init 前的日志尽快按默认配置落盘（后台异步处理
 	// 仍可能与 Init 竞争，若 Init 更早生效则直接写入 Init 配置的文件）。
 	initGraceEnv = "LOG_INIT_GRACE_MS"
+
+	// latestTmpMaxAge 是 latest 链接临时文件的最长保留时间。
+	// 正常替换在微秒级完成，超过该时间仍未改名的 .tmp 只可能是异常退出遗留，
+	// 由滚动时的清理逻辑删除。
+	latestTmpMaxAge = 10 * time.Minute
 )
 
 // config 包含所有可动态调整的配置参数，通过 atomic.Value 原子存储指针，实现无锁读取。
@@ -899,6 +905,7 @@ func (l *Logger) rotate(t time.Time) error {
 	// 建链特权，硬链接同目录、同卷即可，普通账户可用；不支持硬链接的文件系统
 	// 只告警，不影响日志写入。
 	l.relinkLatestLocked(cfg, fileName)
+	l.sweepLatestTmpLocked(cfg, t)
 
 	l.cleanupOldFiles(t)
 	return nil
@@ -909,24 +916,63 @@ func latestLinkPath(cfg *config) string {
 	return filepath.Join(cfg.dir, cfg.prefix+"_latest.log")
 }
 
+// latestTmpPath 返回本次替换使用的唯一临时链接名。
+// 不用固定名 .tmp：进程异常退出遗留在 Link 与 Rename 之间的固定名会让后续
+// os.Link 永远 EEXIST，临时文件再也无法自愈。唯一名让每次替换互不影响，
+// 遗留文件由 sweepLatestTmpLocked 按时间清理。
+func latestTmpPath(linkPath string) string {
+	return fmt.Sprintf("%s.%d-%d.tmp", linkPath, os.Getpid(), time.Now().UnixNano())
+}
+
 // relinkLatestLocked 把 <prefix>_latest.log 重建为指向 fileName 的硬链接。
-// 先建临时名再改名替换，替换失败时保留旧链接；失败只告警一次，避免频繁滚动时刷屏。
+// 先建唯一临时名再改名替换，替换失败时保留旧链接；失败只告警一次，避免频繁滚动时刷屏。
 // 调用方必须持有 mu。
 func (l *Logger) relinkLatestLocked(cfg *config, fileName string) {
 	linkPath := latestLinkPath(cfg)
-	tmpPath := linkPath + ".tmp"
+	tmpPath := latestTmpPath(linkPath)
 
-	_ = os.Remove(tmpPath)
 	if err := os.Link(fileName, tmpPath); err != nil {
 		l.warnLatestLinkLocked("create latest log link", err)
 		return
 	}
 	if err := os.Rename(tmpPath, linkPath); err != nil {
+		// 改名失败时立即删掉本次临时链接；删除也失败则交给 sweepLatestTmpLocked。
 		_ = os.Remove(tmpPath)
 		l.warnLatestLinkLocked("replace latest log link", err)
 		return
 	}
 	l.latestWarned = false
+}
+
+// sweepLatestTmpLocked 清理异常退出遗留的 latest 链接临时文件。
+// 兼容旧版本的固定名 <prefix>_latest.log.tmp 和新版本的
+// <prefix>_latest.log.<pid>-<纳秒>.tmp；只删除超过 latestTmpMaxAge 的文件，
+// 避免误删其它进程正在创建的临时链接。调用方必须持有 mu。
+func (l *Logger) sweepLatestTmpLocked(cfg *config, now time.Time) {
+	entries, err := os.ReadDir(cfg.dir)
+	if err != nil {
+		return
+	}
+	prefix := cfg.prefix + "_latest.log"
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) < latestTmpMaxAge {
+			continue
+		}
+		if err := os.Remove(filepath.Join(cfg.dir, name)); err != nil {
+			fmt.Fprintf(os.Stderr, "remove stale latest link tmp error: %v\n", err)
+		}
+	}
 }
 
 func (l *Logger) warnLatestLinkLocked(action string, err error) {
