@@ -130,8 +130,21 @@ func Issue(t *LoginToken, ttl time.Duration, secret string) string {
 	return EncodePayload(data, secret)
 }
 
-// Parse 验签、解析载荷并校验过期时间
+// DefaultClockSkew 是 Parse 默认容忍的时钟偏差。
+//
+// FIX 2026-11-09 跨机多开: Issue 记的是签发机时间，Parse 比的是验证机时间。
+// 两台机器时钟差几秒，就会出现「token 刚过期」在一侧被拒、另一侧仍有效，
+// 现场只表现为零星的 token expired，很难指向时钟。放开一个容差后行为对
+// NTP 抖动不敏感；代价是有效期实际为 ttl+skew（默认 30s，对 24h TTL 无实质影响）。
+var DefaultClockSkew = 30 * time.Second
+
+// Parse 验签、解析载荷并校验过期时间（容忍 DefaultClockSkew 的时钟偏差）
 func Parse(tokenStr, secret string) (*LoginToken, error) {
+	return ParseWithSkew(tokenStr, secret, DefaultClockSkew)
+}
+
+// ParseWithSkew 同 Parse，由调用方指定可接受的时钟偏差；skew <= 0 表示精确校验。
+func ParseWithSkew(tokenStr, secret string, skew time.Duration) (*LoginToken, error) {
 	payload, err := Decode(tokenStr, secret)
 	if err != nil {
 		return nil, err
@@ -140,7 +153,11 @@ func Parse(tokenStr, secret string) (*LoginToken, error) {
 	if err := json.Unmarshal(payload, &t); err != nil {
 		return nil, fmt.Errorf("payload json unmarshal: %w", err)
 	}
-	if time.Now().Unix() > t.Expire {
+	var grace int64
+	if skew > 0 {
+		grace = int64(skew / time.Second)
+	}
+	if time.Now().Unix() > t.Expire+grace {
 		return nil, errors.New("token expired")
 	}
 	return &t, nil

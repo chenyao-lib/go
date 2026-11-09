@@ -436,8 +436,9 @@ func (m *Manager) Close() error {
 			len(entries),
 		)
 		m.cancel()
-		if m.pubsub != nil {
-			if err := m.pubsub.Close(); err != nil {
+		// 与 resubscribeKicks 的替换互斥：这里取走并清空，避免关掉刚换上的新订阅。
+		if ps := m.swapPubSub(nil); ps != nil {
+			if err := ps.Close(); err != nil {
 				log.Warn("关闭踢线订阅失败: err=%v", err)
 				closeErr = err
 			}
@@ -525,31 +526,95 @@ func (m *Manager) publishKick(ctx context.Context, key, connectionID string) err
 
 func (m *Manager) listenKicks() {
 	defer m.wg.Done()
-	channel := m.pubsub.Channel()
-	for {
-		select {
-		case <-m.ctx.Done():
+
+	// FIX 2026-11-09 跨机多开: 旧实现在订阅 channel 关闭后直接 return。
+	// Redis 重启、主从切换、网络抖动都会让订阅静默断开，而断开之后本进程再也
+	// 收不到「被别的实例顶号」的通知 —— 老连接继续在线、新实例也认为自己持有
+	// owner，双主就永久存在（renewConnections 只能自愈「自己丢了 owner」，
+	// 发现不了「别人抢走了但没通知我」）。改为断线后退避重订阅。
+	const resubscribeDelay = time.Second
+
+	for m.ctx.Err() == nil {
+		pubsub := m.currentPubSub()
+		if pubsub == nil {
 			return
-		case message, ok := <-channel:
-			if !ok {
-				if m.ctx.Err() == nil {
-					log.Warn("踢线订阅意外关闭: channel=%s", m.kickChannel())
-				}
+		}
+		channel := pubsub.Channel()
+		dropped := false
+
+		for !dropped {
+			select {
+			case <-m.ctx.Done():
 				return
+			case message, ok := <-channel:
+				if !ok {
+					dropped = true
+					continue
+				}
+				var kick kickMessage
+				if err := json.Unmarshal([]byte(message.Payload), &kick); err != nil {
+					log.Warn("解析踢线消息失败: payload=%s, err=%v", message.Payload, err)
+					continue
+				}
+				entry := m.connectionByID(kick.ConnectionID)
+				if entry == nil || entry.key != kick.Key {
+					continue
+				}
+				// connection_id 精确匹配，避免延迟到达的消息踢掉后来建立的新连接。
+				m.closeConnection(entry, "replaced by connection on another server", nil)
 			}
-			var kick kickMessage
-			if err := json.Unmarshal([]byte(message.Payload), &kick); err != nil {
-				log.Warn("解析踢线消息失败: payload=%s, err=%v", message.Payload, err)
+		}
+
+		if m.ctx.Err() != nil {
+			return
+		}
+		log.Warn("踢线订阅意外关闭，%s 后重新订阅: channel=%s", resubscribeDelay, m.kickChannel())
+
+		for {
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-time.After(resubscribeDelay):
+			}
+			if err := m.resubscribeKicks(); err != nil {
+				log.Error("重新订阅踢线频道失败，将继续重试: channel=%s, err=%v", m.kickChannel(), err)
 				continue
 			}
-			entry := m.connectionByID(kick.ConnectionID)
-			if entry == nil || entry.key != kick.Key {
-				continue
-			}
-			// connection_id 精确匹配，避免延迟到达的消息踢掉后来建立的新连接。
-			m.closeConnection(entry, "replaced by connection on another server", nil)
+			break
 		}
 	}
+}
+
+// currentPubSub 取当前踢线订阅，供 listenKicks 读取。
+func (m *Manager) currentPubSub() *redis.PubSub {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.pubsub
+}
+
+// swapPubSub 原子替换踢线订阅并返回旧实例，避免 Close 与重订阅互相踩。
+func (m *Manager) swapPubSub(next *redis.PubSub) *redis.PubSub {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old := m.pubsub
+	m.pubsub = next
+	return old
+}
+
+// resubscribeKicks 重新建立踢线订阅；成功后关闭旧订阅实例。
+func (m *Manager) resubscribeKicks() error {
+	ps := m.client.Subscribe(m.ctx, m.kickChannel())
+	ctx, cancel := withRedisTimeout(m.ctx)
+	defer cancel()
+	if _, err := ps.Receive(ctx); err != nil {
+		_ = ps.Close()
+		return err
+	}
+	if old := m.swapPubSub(ps); old != nil {
+		_ = old.Close()
+	}
+	log.Info("踢线订阅已重新建立: channel=%s", m.kickChannel())
+	return nil
 }
 
 func (m *Manager) renewConnections() {

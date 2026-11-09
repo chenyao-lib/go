@@ -127,12 +127,32 @@ func WithStrategy(s SelectStrategy) NodeWatcherOption {
 	}
 }
 
+// parseEndpoints 把 "10.0.0.1:2379,10.0.0.2:2379" 拆成地址切片。
+//
+// 旧实现固定写 []string{endpoints}，配置里填多个 etcd 会被当成「一个非法地址」，
+// clientv3 仍能构造成功，只在后续请求时挨个超时——表现是集群配好了却一个都连不上。
+func parseEndpoints(endpoints string) []string {
+	parts := strings.Split(endpoints, ",")
+	eps := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			eps = append(eps, p)
+		}
+	}
+	return eps
+}
+
 // NewWatcher 创建节点发现器
 func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOption) (*NodeWatcher, error) {
-	log.Info("connecting to etcd: %s", endpoints)
+	eps := parseEndpoints(endpoints)
+	if len(eps) == 0 {
+		log.Error("etcd endpoints 为空: prefix=%s", prefix)
+		return nil, errors.New("etcd endpoints is empty")
+	}
+	log.Info("connecting to etcd: %v", eps)
 
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{endpoints},
+		Endpoints:   eps,
 		DialTimeout: 5 * time.Second,
 	})
 	if err != nil {
