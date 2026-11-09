@@ -87,14 +87,17 @@ type ServerInfo struct {
 // NodeWatcher 通用节点发现器
 // 监听 etcd 特定 prefix 下的节点变化，将节点列表同步到指定的 SelectStrategy 中
 type NodeWatcher struct {
-	cli       *clientv3.Client
-	prefix    string
-	leaseTTL  int // 仅为兼容 NewWatcher 签名保留，watcher 不创建租约
-	strategy  SelectStrategy
-	ctx       context.Context // 生命周期 context，仅 Close 时取消（与租约解耦）
-	cancel    context.CancelFunc
-	startOnce sync.Once
-	closeOnce sync.Once
+	cli    *clientv3.Client
+	prefix string // 调用方传入的原始前缀，仅用于日志与 key 解析
+	// watchPrefix 是实际用于 etcd Get/Watch 的前缀，恒以 "/" 结尾。
+	// 不补分隔符时，兄弟命名空间会被当成节点（见 normalizeWatchPrefix）。
+	watchPrefix string
+	leaseTTL    int // 仅为兼容 NewWatcher 签名保留，watcher 不创建租约
+	strategy    SelectStrategy
+	ctx         context.Context // 生命周期 context，仅 Close 时取消（与租约解耦）
+	cancel      context.CancelFunc
+	startOnce   sync.Once
+	closeOnce   sync.Once
 
 	// mu 保护 keyAddrs，并保证「缓存变更 + 策略变更」成对生效。
 	mu sync.Mutex
@@ -142,6 +145,28 @@ func parseEndpoints(endpoints string) []string {
 	return eps
 }
 
+// normalizeWatchPrefix 把 watch 前缀规范成以 "/" 结尾的分隔前缀。ADD 2026-11-09
+//
+// etcd 的 WithPrefix 是「字节区间」匹配，不是路径层级匹配：
+//
+//	prefix="fishserver"  →  区间 ["fishserver", "fishserves")
+//	                        'r'(0x72) → 's'(0x73)
+//
+// 于是 "fishserver_t1/192.168.3.90:55301" 的前 10 字节与上界前缀相同，
+// 第 11 字节 '_'(0x5F) 小于 0x73，整个 key 落在区间内被一并捞出来——
+// 测试/预发/灰度实例就这样混进了生产的一致性哈希环，center 会把真实
+// 玩家路由到它们上面（生产实测：key=fishserver_t1/... 被 Added node）。
+//
+// 注册侧 key 恒为 {prefix}/{addr}（etcd/register 与各服务注册代码），
+// 监听侧补上同一个分隔符后区间变为 ["fishserver/", "fishserver0")，
+// '_'(0x5F) 大于上界 '0'(0x30)，兄弟命名空间不再命中，两侧得以对称。
+func normalizeWatchPrefix(prefix string) string {
+	if prefix == "" || strings.HasSuffix(prefix, "/") {
+		return prefix
+	}
+	return prefix + "/"
+}
+
 // NewWatcher 创建节点发现器
 func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOption) (*NodeWatcher, error) {
 	eps := parseEndpoints(endpoints)
@@ -160,17 +185,22 @@ func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOptio
 		return nil, errors.New("etcd client error: " + err.Error())
 	}
 
+	// 默认使用轮询策略
 	nw := &NodeWatcher{
-		cli:      cli,
-		prefix:   prefix,
-		leaseTTL: leaseTTL,
-		// 默认使用轮询策略
-		strategy: NewRoundRobinStrategy(),
-		keyAddrs: make(map[string]string),
+		cli:         cli,
+		prefix:      prefix,
+		watchPrefix: normalizeWatchPrefix(prefix),
+		leaseTTL:    leaseTTL,
+		strategy:    NewRoundRobinStrategy(),
+		keyAddrs:    make(map[string]string),
 	}
 
 	for _, opt := range opts {
 		opt(nw)
+	}
+
+	if nw.watchPrefix != prefix {
+		log.Info("[Watcher] 前缀已补分隔符: %q -> %q（etcd 字节前缀会吞掉同前缀的兄弟命名空间）", prefix, nw.watchPrefix)
 	}
 
 	return nw, nil
@@ -202,7 +232,7 @@ func (nw *NodeWatcher) Start() error {
 
 		// 3. 启动 watcher
 		go nw.watchNodes()
-		log.Info("节点发现启动成功: prefix=%s, strategy=%T, nodes=%d", nw.prefix, nw.strategy, len(nw.Nodes()))
+		log.Info("节点发现启动成功: prefix=%q, watchPrefix=%q, strategy=%T, nodes=%d", nw.prefix, nw.watchPrefix, nw.strategy, len(nw.Nodes()))
 	})
 	return startErr
 }
@@ -293,12 +323,12 @@ func extractAddrFromKey(key, serverPrefix string) string {
 // watch 断开（etcd 重启、网络抖动、watch 粒度重建等导致 channel 关闭）后
 // 自动重连并全量重新同步节点——否则断连期间错过的增删会让本地列表永久冻结。
 func (nw *NodeWatcher) watchNodes() {
-	log.Info("etcd watch nodes started, prefix=%s", nw.prefix)
+	log.Info("etcd watch nodes started, prefix=%q, watchPrefix=%q", nw.prefix, nw.watchPrefix)
 
 	const retryDelay = 2 * time.Second
 
 	for nw.ctx.Err() == nil {
-		watchChan := nw.cli.Watch(nw.ctx, nw.prefix, clientv3.WithPrefix())
+		watchChan := nw.cli.Watch(nw.ctx, nw.watchPrefix, clientv3.WithPrefix())
 
 		// 每轮都"先建 watch 再全量同步"：快照与 watch 建立之间的事件由
 		// channel 缓冲补放，配合 AddNode 去重 / RemoveNode 幂等保证最终一致。
@@ -408,7 +438,7 @@ type nodeEntry struct {
 func (nw *NodeWatcher) fetchNodes(ctx context.Context) ([]nodeEntry, error) {
 	log.Info("loading existing nodes from etcd...")
 
-	resp, err := nw.cli.Get(ctx, nw.prefix, clientv3.WithPrefix())
+	resp, err := nw.cli.Get(ctx, nw.watchPrefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, errors.New("etcd get nodes error: " + err.Error())
 	}
