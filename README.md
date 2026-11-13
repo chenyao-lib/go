@@ -29,6 +29,7 @@ go get github.com/chenyao-lib/go@v1.3.7
 | `etcd/register` | 基于 etcd 租约的服务注册、保活、自动重注册 |
 | `etcd/watcher` | 从 etcd 前缀加载并监听节点，支持轮询/一致性哈希/自定义选点 |
 | `redis/connlease` | 用 Redis 租约 + Pub/Sub + fencing epoch 保证同一会话只有一个有效连接 |
+| `redis/leader` | 基于 Redis 租约 + Lua 的主节点选举，Go 与 Node.js 共用脚本和 key 布局 |
 | `httpapi` | 约定式 HTTP API 客户端：JSON 数据信封、表单、可插拔加解密 |
 
 ## 各包速览
@@ -256,6 +257,37 @@ manager.Unregister(ctx, handle)
 
 `ServerAddr` 必须唯一标识当前节点；续租间隔必须小于租约 TTL。所有权变化通过踢线回调通知。
 
+### redis/leader
+
+```go
+election, err := leader.Open(ctx, leader.Config{
+	Addr:     "127.0.0.1:6379", // host:port，单地址，不支持 Sentinel/Cluster
+	Password: "",               // 没有密码留空
+	DB:       0,                // 与业务读写同一个库
+	Group:    "billing",        // 同一 group 的进程竞争同一个主节点
+	Owner:    "billing-01",     // 必须唯一标识一个进程
+	TTL:   10 * time.Second, // 默认 10 秒；续租/重试间隔默认 TTL/3
+	OnChange: func(ev leader.Event) {
+		if ev.IsLeader {
+			startPrimaryWork()
+		} else {
+			stopPrimaryWork()
+		}
+	},
+})
+defer election.Close()
+
+election.IsLeader() // 热路径：纯内存，并校验本地租约是否到期
+election.Epoch()    // 当前任期 fencing token，非主节点为 0
+election.Leader(ctx)
+election.Resign(ctx) // 主动让位并停止选举
+```
+
+Redis 短暂不可用时本地租约到期前继续担任主节点，到期自动降级；被其它节点接管立即降级。
+关闭时尽力释放租约，其它节点不用等 TTL。Node.js 等其它语言按 `leader.go` 包注释里的
+key 布局（`leader:{group}:owner` / `leader:{group}:epoch`）执行同样的两个 Lua 脚本
+（`acquireScript` / `releaseScript`）即可参与同一个 group 的选举。
+
 ### httpapi
 
 ```go
@@ -279,6 +311,7 @@ if errors.As(err, &apiErr) { /* code != 0 的业务错误 */ }
 客户端：clt + payloadcodec
 发现：  etcd/register（注册） + etcd/watcher（选点）
 会话：  redis/connlease（同一 session 全局单连接）
+选主：  redis/leader（多个同构服务只保留一个主节点）
 ```
 
 ## 约定

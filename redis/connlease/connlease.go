@@ -96,9 +96,18 @@ var (
 
 // acquireScript 在一个 Redis 原子操作中替换 owner、递增 fencing epoch 并刷新租约。
 // 返回旧 owner 是为了让新连接能够通过 PubSub 精确踢掉旧 connection_id。
+// epoch key 与 renewScript 对称：缺失时先从 owner hash 恢复再递增。
+// 否则 epoch key 被驱逐或丢失后 INCR 会从 0 重新开始，fencing token 回退，
+// 下游按 epoch 拒绝旧写入的保护会静默失效。
 var acquireScript = redis.NewScript(`
 local old_server = redis.call("HGET", KEYS[1], "server_addr") or ""
 local old_connection = redis.call("HGET", KEYS[1], "connection_id") or ""
+if redis.call("EXISTS", KEYS[2]) == 0 then
+	local epoch = redis.call("HGET", KEYS[1], "epoch")
+	if epoch then
+		redis.call("SET", KEYS[2], epoch)
+	end
+end
 local epoch = redis.call("INCR", KEYS[2])
 redis.call("HSET", KEYS[1],
 	"server_addr", ARGV[1],
@@ -180,7 +189,10 @@ type Handle struct {
 	// renewFailures 记录连续续租失败次数，成功一次即清零。
 	// 只有达到阈值才关闭连接，避免 Redis 瞬时抖动导致全量踢线。
 	renewFailures atomic.Int32
-	closeOnce     sync.Once
+	// released 表示调用方已通过 Unregister 主动注销。
+	// 续租快照可能滞后于 Unregister，没有它会对正在正常关闭的连接再回调一次 closeFn。
+	released  atomic.Bool
+	closeOnce sync.Once
 }
 
 // Key 返回注册该连接时使用的会话 key。
@@ -381,7 +393,12 @@ func (m *Manager) Unregister(ctx context.Context, handle *Handle) {
 		)
 		return
 	}
-	releaseCtx, cancel := withRedisTimeout(ctx)
+	// 释放属于关闭清理，不能因为调用方 ctx 已取消（连接关闭路径上很常见）
+	// 而直接失败，否则 owner 只能等 TTL 过期；只保留 value，超时单独控制。
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	releaseCtx, cancel := withRedisTimeout(context.WithoutCancel(ctx))
 	defer cancel()
 	released, err := releaseScript.Run(
 		releaseCtx,
@@ -627,6 +644,10 @@ func (m *Manager) renewConnections() {
 			return
 		case <-ticker.C:
 			for _, entry := range m.connectionSnapshot() {
+				// 快照可能包含本轮 tick 之前已被 Unregister 的连接，跳过。
+				if m.connectionByID(entry.connectionID) != entry {
+					continue
+				}
 				ctx, cancel := context.WithTimeout(m.ctx, redisCallTimeout)
 				renewed, err := renewScript.Run(
 					ctx,
@@ -664,6 +685,10 @@ func (m *Manager) renewConnections() {
 }
 
 func (m *Manager) closeConnection(entry *Handle, reason string, cause error) {
+	// 已主动注销的连接由调用方负责关闭，这里不再重复回调。
+	if entry.released.Load() {
+		return
+	}
 	// 必须先失效本地状态；即使 WebSocket 关闭需要时间，后续消息也会立即被拒绝。
 	entry.active.Store(false)
 	entry.closeOnce.Do(func() {
@@ -714,6 +739,7 @@ func (m *Manager) removeConnection(handle *Handle) *Handle {
 		return nil
 	}
 	delete(m.byConnectionID, entry.connectionID)
+	entry.released.Store(true)
 	return entry
 }
 
