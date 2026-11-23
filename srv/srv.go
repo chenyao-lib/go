@@ -5,7 +5,9 @@
 //
 //	server := srv.NewServer(":8080")
 //	server.SetOriginPatterns("https://example.com")
-//	server.SetHandlerQueueSize(1024)
+//	server.SetReadLimit(32 * 1024)
+//	server.SetHandlerQueueSize(128)
+//	server.SetRateLimit(100, 256 * 1024)
 //
 //	server.RegisterHandler("worker", "job.run", func(
 //		client *srv.Client,
@@ -53,9 +55,11 @@
 // RegisterHandler 按 clientType 和 method 路由；RegisterDefaultHandler 处理
 // 未注册方法。对于已连接客户端，可通过 GetClientByID、WalkClient 或
 // SendByID 查找和推送；Client.Call/CallT 可由服务端反向调用客户端并等待响应。
+// 同 ID 的新连接完成认证后会替换旧会话，旧会话会收到保留事件 session.kicked。
 //
 // SetOnClientReady 和 SetOnClientClose 注册连接生命周期回调。使用
 // srvsvcbinding 时不要再覆盖这两个回调或默认 Handler，因为 binding 会接管它们。
+// OnClientClose 在读取循环退出后立即执行，此时业务 Handler 可能仍在收尾。
 //
 // NewServer 为兼容旧行为默认允许所有 Origin。对外服务应显式调用
 // SetOriginPatterns 设置可信来源。
@@ -63,10 +67,12 @@ package srv
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -82,11 +88,13 @@ import (
 )
 
 const (
-	writeWait           = 10 * time.Second
-	authWait            = 10 * time.Second
-	pongWait            = 10 * time.Second
-	pingPeriod          = (pongWait * 9) / 10
-	defaultHandlerQueue = 1024
+	writeWait                = 10 * time.Second
+	authWait                 = 10 * time.Second
+	defaultHeartbeatInterval = 9 * time.Second
+	defaultReadLimit         = 32 * 1024
+	defaultHandlerQueue      = 128
+	defaultMessagesPerSec    = 100
+	defaultBytesPerSec       = 256 * 1024
 )
 
 // WsServer 代表一个独立的 WebSocket 服务实例
@@ -94,24 +102,33 @@ type WsServer struct {
 	WsPort  string
 	connMgr *ConnManager
 
-	// 状态存储（原全局变量移动到此处）
-	clientPool map[string]map[string]*Client
-	poolMu     sync.RWMutex
-
+	clientsMu   sync.RWMutex // 同时保护两个连接索引
+	clientPool  map[string]map[string]*Client
 	clientIDMap map[string]*Client
-	idMapMu     sync.RWMutex
 
 	handlers       map[string]map[string]Handler
 	defaultHandler Handler
 	handlersMu     sync.RWMutex
 
-	httpServer *http.Server
+	lifecycleMu   sync.Mutex
+	httpServer    *http.Server
+	stopping      bool
+	connections   map[*Client]struct{}
+	connectionsWG sync.WaitGroup
+	shutdownDone  chan struct{}
+	shutdownErr   error
+	shutdownGrace time.Duration
+	forceOnce     sync.Once
 
-	acceptOptions websocket.AcceptOptions
-	handlerQueue  int
-	authenticator Authenticator
-	onClientReady ClientHook
-	onClientClose ClientHook
+	acceptOptions     websocket.AcceptOptions
+	handlerQueue      int
+	heartbeatInterval time.Duration
+	readLimit         int64
+	messageRate       int
+	byteRate          int64
+	authenticator     Authenticator
+	onClientReady     ClientHook
+	onClientClose     ClientHook
 }
 
 type AuthResult struct {
@@ -130,9 +147,36 @@ func (s *WsServer) SetOriginPatterns(patterns ...string) {
 	s.acceptOptions.InsecureSkipVerify = false
 }
 
+// SetReadLimit 设置单条 WebSocket 消息及解码后的 RPC 内容的字节上限，默认 32 KiB。
+// 在 Start 前调用。无效值会被忽略。
+func (s *WsServer) SetReadLimit(n int64) {
+	if n > 0 && n < math.MaxInt64 {
+		s.readLimit = n
+	}
+}
+
+// SetRateLimit 设置每条已认证连接的接收速率，默认每秒 100 条、256 KiB。
+// 突发额度为一秒的速率，字节额度至少能容纳一条达到读上限的消息。
+// 超限时以 1013 关闭连接。在 Start 前调用，两个参数均须为正数。
+func (s *WsServer) SetRateLimit(messagesPerSecond int, bytesPerSecond int64) {
+	if messagesPerSecond > 0 && bytesPerSecond > 0 {
+		s.messageRate = messagesPerSecond
+		s.byteRate = bytesPerSecond
+	}
+}
+
+// SetHandlerQueueSize 设置每连接业务队列容量，默认 128 条。在 Start 前调用。
 func (s *WsServer) SetHandlerQueueSize(n int) {
 	if n > 0 {
 		s.handlerQueue = n
+	}
+}
+
+// SetHeartbeatInterval 设置服务端发送 Ping 的间隔，默认 9 秒。
+// 在 Start 前调用。非正值会被忽略。
+func (s *WsServer) SetHeartbeatInterval(interval time.Duration) {
+	if interval > 0 {
+		s.heartbeatInterval = interval
 	}
 }
 
@@ -142,10 +186,15 @@ func (s *WsServer) SetAuthenticator(authenticator Authenticator) {
 	}
 }
 
+// SetOnClientReady 注册认证成功回调，在消息循环启动前同步执行；回调阻塞期间
+// 连接不会处理消息，Shutdown 也会等待它返回。
 func (s *WsServer) SetOnClientReady(fn ClientHook) {
 	s.onClientReady = fn
 }
 
+// SetOnClientClose 注册连接关闭回调。回调在读取循环退出、连接已从索引移除后
+// 同步执行；此时连接 Context 已取消，但业务 Handler 可能仍在收尾，不要假设
+// 所有业务 goroutine 都已退出。
 func (s *WsServer) SetOnClientClose(fn ClientHook) {
 	s.onClientClose = fn
 }
@@ -153,12 +202,8 @@ func (s *WsServer) SetOnClientClose(fn ClientHook) {
 // --- 核心结构 ---
 
 type ConnManager struct {
-	// 直接用 *websocket.Conn 映射其发送通道
-	Clients    map[*websocket.Conn]*Client
-	Broadcast  chan []byte
-	Register   chan *Client
-	Unregister chan *Client
-	Lock       sync.RWMutex
+	Clients map[*websocket.Conn]*Client
+	Lock    sync.RWMutex
 }
 
 type RPCMessage struct {
@@ -181,67 +226,61 @@ type AuthResponse struct {
 type Handler func(clt *Client, msg RPCMessage) (any, error)
 
 type Client struct {
-	Conn   *websocket.Conn
-	Server *WsServer // 反向引用所属的 Server 实例
-	ctx    context.Context
-	cancel context.CancelFunc
-	IP     string
-	Port   int
-	SendCh chan []byte
-	Type   string //客户端类型
-	ID     string //客户端ID，全局唯一
-	codec  payloadcodec.Codec
+	Conn      *websocket.Conn
+	Server    *WsServer // 反向引用所属的 Server 实例
+	transport net.Conn
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeDone chan struct{}
+	IP        string
+	Port      int
+	SendCh    chan []byte
+	Type      string //客户端类型
+	ID        string //客户端ID，全局唯一
+	codec     payloadcodec.Codec
 
-	pending     map[string]chan *RPCMessage
-	pendingMu   sync.Mutex
-	sessionSeed int64
-	closed      atomic.Bool // 标记连接是否已关闭（SendCh 已 close）
-	sendMu      sync.RWMutex
-	HandlerCh   chan RPCMessage
+	pending    map[string]chan *RPCMessage
+	pendingMu  sync.Mutex
+	closing    atomic.Bool // 确保只由一个协程关闭连接
+	sendMu     sync.RWMutex
+	sendClosed bool
+	HandlerCh  chan RPCMessage
+}
+
+// Context 返回连接的上下文。连接关闭或被强制断开时，上下文会被取消。
+func (c *Client) Context() context.Context {
+	return c.ctx
 }
 
 // --- 逻辑实现 ---
 
-func (m *ConnManager) Start() {
-	for {
-		select {
-		case client := <-m.Register:
-			m.Lock.Lock()
-			m.Clients[client.Conn] = client
-			count := len(m.Clients)
-			m.Lock.Unlock()
-			log.Info("新连接接入, IP：%s:%d，当前总连接数: %d", client.IP, client.Port, count)
+func (m *ConnManager) register(client *Client) {
+	m.Lock.Lock()
+	m.Clients[client.Conn] = client
+	count := len(m.Clients)
+	m.Lock.Unlock()
+	log.Info("新连接接入, IP：%s:%d，当前总连接数: %d", client.IP, client.Port, count)
+}
 
-		case client := <-m.Unregister:
-			m.Lock.Lock()
-			if _, ok := m.Clients[client.Conn]; ok {
-				delete(m.Clients, client.Conn)
-				client.sendMu.Lock()
-				client.closed.Store(true) // 先标记
-				close(client.SendCh)
-				client.sendMu.Unlock()
-				count := len(m.Clients)
-				log.Info("连接断开, IP: %s:%d，剩余连接数: %d", client.IP, client.Port, count)
-			}
-			m.Lock.Unlock()
-
-		case message := <-m.Broadcast:
-			m.Lock.RLock()
-			for _, client := range m.Clients {
-				select {
-				case client.SendCh <- message:
-				default:
-					// 某个连接写缓冲区满了，忽略或处理
-				}
-			}
-			m.Lock.RUnlock()
-		}
+func (m *ConnManager) unregister(client *Client) {
+	m.Lock.Lock()
+	if _, ok := m.Clients[client.Conn]; !ok {
+		m.Lock.Unlock()
+		return
 	}
+	delete(m.Clients, client.Conn)
+	count := len(m.Clients)
+	client.sendMu.Lock()
+	client.sendClosed = true
+	close(client.SendCh)
+	client.sendMu.Unlock()
+	m.Lock.Unlock()
+	log.Info("连接断开, IP: %s:%d，剩余连接数: %d", client.IP, client.Port, count)
 }
 
 // 外部调用的 Send 函数保持不变...
 func (c *Client) Send(method string, arg any) error {
-	if c.closed.Load() {
+	if c.closing.Load() {
 		return errors.New("client connection closed")
 	}
 
@@ -263,7 +302,7 @@ func (c *Client) Send(method string, arg any) error {
 
 	c.sendMu.RLock()
 	defer c.sendMu.RUnlock()
-	if c.closed.Load() {
+	if c.sendClosed || c.closing.Load() {
 		return errors.New("client connection closed")
 	}
 	select {
@@ -275,7 +314,7 @@ func (c *Client) Send(method string, arg any) error {
 }
 
 func (c *Client) Call(method string, arg any, timeout time.Duration) (json.RawMessage, error) {
-	if c.closed.Load() {
+	if c.closing.Load() {
 		return nil, errors.New("client connection closed")
 	}
 	// 序列化参数
@@ -285,7 +324,8 @@ func (c *Client) Call(method string, arg any, timeout time.Duration) (json.RawMe
 		return nil, err
 	}
 
-	session := c.nextSession()
+	// 保留请求方向前缀，用密码学随机字符串防止对端提前猜中会话。
+	session := "srv-" + rand.Text()
 	rspChan := make(chan *RPCMessage, 1)
 
 	// 注册等待队列
@@ -313,12 +353,15 @@ func (c *Client) Call(method string, arg any, timeout time.Duration) (json.RawMe
 	}
 
 	c.sendMu.RLock()
-	if c.closed.Load() {
+	if c.sendClosed || c.closing.Load() {
 		c.sendMu.RUnlock()
 		return nil, errors.New("client connection closed")
 	}
 	select {
 	case c.SendCh <- b:
+	case <-c.ctx.Done():
+		c.sendMu.RUnlock()
+		return nil, errors.New("client connection closed")
 	case <-time.After(writeWait):
 		c.sendMu.RUnlock()
 		return nil, errors.New("send timeout")
@@ -339,6 +382,9 @@ func (c *Client) Call(method string, arg any, timeout time.Duration) (json.RawMe
 }
 
 func (c *Client) otherResponse(msg *RPCMessage) bool {
+	if msg.Session == "" || msg.Method != "" || (len(msg.Data) != 0 && !json.Valid(msg.Data)) {
+		return false
+	}
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 	ch, exists := c.pending[msg.Session]
@@ -355,7 +401,7 @@ func (c *Client) otherResponse(msg *RPCMessage) bool {
 }
 
 func (c *Client) meResponse(session string, data any, err error) {
-	if c.closed.Load() {
+	if c.closing.Load() {
 		log.Warn("meResponse: client already closed, drop response for session %s", session)
 		return
 	}
@@ -378,38 +424,30 @@ func (c *Client) meResponse(session string, data any, err error) {
 		return
 	}
 	c.sendMu.RLock()
-	if c.closed.Load() {
+	if c.sendClosed || c.closing.Load() {
 		c.sendMu.RUnlock()
 		log.Warn("meResponse: client already closed, drop response for session %s", session)
 		return
 	}
 	select {
 	case c.SendCh <- b:
+	case <-c.ctx.Done():
 	case <-time.After(writeWait):
 		log.Warn("meResponse: send timeout, drop response for session %s", session)
 	}
 	c.sendMu.RUnlock()
 }
 
-// nextSession 生成服务端发起的 RPC 会话 ID。
-// 加 "srv-" 前缀与客户端前缀隔离：两端 nextSession 都是从 1 开始的自增数字，
-// 不加前缀时服务端请求 session 可能与客户端请求 session 相同，导致
-// otherResponse 把对方的请求误判为响应并吞掉。
-func (c *Client) nextSession() string {
-	return "srv-" + strconv.FormatInt(atomic.AddInt64(&c.sessionSeed, 1), 10)
-}
-
 // --- 读写泵 (Pumps) ---
 
-func (c *Client) readPump() {
+func (c *Client) readPump(readLimit int64, limiter inboundLimiter) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("readPump panic recovered: %v, client %s:%d", r, c.IP, c.Port)
 		}
-		c.cancel()
+		c.closeNow()
 		c.removeFromPool()
-		c.Server.connMgr.Unregister <- c
-		c.Conn.CloseNow()
+		c.Server.connMgr.unregister(c)
 		c.Server.callClientClose(c)
 	}()
 
@@ -424,6 +462,14 @@ func (c *Client) readPump() {
 			break
 		}
 
+		if !limiter.allow(time.Now(), len(data)) {
+			c.CloseWithReason(websocket.StatusTryAgainLater, "message rate limit exceeded")
+			return
+		}
+		if c.closing.Load() {
+			continue
+		}
+
 		switch msgType {
 		case websocket.MessageText:
 			var msg RPCMessage
@@ -432,8 +478,8 @@ func (c *Client) readPump() {
 				log.Info("收到非法消息: %s", string(data))
 				continue
 			}
-			if err := c.decodeRPCMessage(&msg); err != nil {
-				log.Warn("客户端消息解密失败: client=%s, method=%s, session=%s, err=%v",
+			if err := c.decodeRPCMessage(&msg, readLimit); err != nil {
+				log.Warn("拒绝解码后的客户端消息: client=%s, method=%s, session=%s, err=%v",
 					c.ID, msg.Method, msg.Session, err)
 				continue
 			}
@@ -464,33 +510,31 @@ func isNormalReadClose(err error) bool {
 }
 
 func (c *Client) writePump() {
-	ticker := time.NewTicker(pingPeriod)
+	ticker := time.NewTicker(c.Server.heartbeatInterval)
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("writePump panic recovered: %v, client %s:%d", r, c.IP, c.Port)
 		}
 		ticker.Stop()
-		c.Conn.CloseNow()
+		c.closeNow()
 	}()
 
 	for {
 		select {
 		case <-c.ctx.Done():
-			_ = c.Conn.Close(websocket.StatusNormalClosure, "")
 			return
 		case message, ok := <-c.SendCh:
-			if !ok {
-				_ = c.Conn.Close(websocket.StatusNormalClosure, "")
+			if !ok || c.closing.Load() {
 				return
 			}
-			ctx, cancel := context.WithTimeout(c.ctx, writeWait)
-			err := c.Conn.Write(ctx, websocket.MessageText, message)
-			cancel()
-			if err != nil {
+			if err := c.writeText(message, writeWait); err != nil {
 				return
 			}
 
 		case <-ticker.C:
+			if c.closing.Load() {
+				return
+			}
 			ctx, cancel := context.WithTimeout(c.ctx, writeWait)
 			err := c.Conn.Ping(ctx)
 			cancel()
@@ -503,22 +547,26 @@ func (c *Client) writePump() {
 
 func NewServer(wsPort string) (s *WsServer) {
 	s = &WsServer{
-		WsPort:      wsPort,
-		clientPool:  make(map[string]map[string]*Client),
-		clientIDMap: make(map[string]*Client),
-		handlers:    make(map[string]map[string]Handler),
+		WsPort:        wsPort,
+		clientPool:    make(map[string]map[string]*Client),
+		clientIDMap:   make(map[string]*Client),
+		handlers:      make(map[string]map[string]Handler),
+		connections:   make(map[*Client]struct{}),
+		shutdownDone:  make(chan struct{}),
+		shutdownGrace: defaultShutdownGracePeriod,
 		acceptOptions: websocket.AcceptOptions{
 			InsecureSkipVerify: true,
 		},
-		handlerQueue:  defaultHandlerQueue,
-		authenticator: defaultAuthenticator,
+		handlerQueue:      defaultHandlerQueue,
+		heartbeatInterval: defaultHeartbeatInterval,
+		readLimit:         defaultReadLimit,
+		messageRate:       defaultMessagesPerSec,
+		byteRate:          defaultBytesPerSec,
+		authenticator:     defaultAuthenticator,
 	}
 	// 直接初始化结构体
 	mgr := &ConnManager{
-		Clients:    make(map[*websocket.Conn]*Client),
-		Broadcast:  make(chan []byte),
-		Register:   make(chan *Client),
-		Unregister: make(chan *Client),
+		Clients: make(map[*websocket.Conn]*Client),
 	}
 	s.connMgr = mgr
 	// 默认 InsecureSkipVerify=true 会接受任意 Origin；保持兼容但明确提示，
@@ -528,68 +576,35 @@ func NewServer(wsPort string) (s *WsServer) {
 }
 
 func (s *WsServer) Start() error {
-	mgr := s.connMgr
-	go mgr.Start()
-
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, &s.acceptOptions)
-		if err != nil {
-			log.Warn("WebSocket 握手失败, remote=%s, origin=%s, err=%v",
-				r.RemoteAddr, r.Header.Get("Origin"), err)
-			return
-		}
+	mux.HandleFunc("/ws", s.serveWebSocket)
 
-		connCtx, connCancel := context.WithCancel(context.Background())
-		client := &Client{
-			Conn:        conn,
-			Server:      s,
-			ctx:         connCtx,
-			cancel:      connCancel,
-			SendCh:      make(chan []byte, 512),
-			pending:     make(map[string]chan *RPCMessage),
-			sessionSeed: 0,
-			Type:        "",
-			HandlerCh:   make(chan RPCMessage, s.handlerQueue),
-		}
-
-		host, port, err := net.SplitHostPort(r.RemoteAddr)
-		if err == nil {
-			client.IP = host
-			if p, convErr := strconv.Atoi(port); convErr == nil {
-				client.Port = p
-			} else {
-				client.Port = -1
-			}
-		} else {
-			client.IP = r.RemoteAddr
-			client.Port = -1
-		}
-
-		conn.SetReadLimit(512 * 1024)
-		if err := client.authenticate(authWait); err != nil {
-			log.Warn("认证失败, IP: %s:%d, err: %v", client.IP, client.Port, err)
-			connCancel()
-			conn.CloseNow()
-			return
-		}
-
-		mgr.Register <- client
-		s.callClientReady(client)
-		go client.handlerPump()
-		go client.writePump()
-		go client.readPump()
-	})
-
-	s.httpServer = &http.Server{
+	httpServer := &http.Server{
 		Addr:              s.WsPort,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
+	s.lifecycleMu.Lock()
+	if s.stopping {
+		s.lifecycleMu.Unlock()
+		return errors.New("websocket server is shut down")
+	}
+	if s.httpServer != nil {
+		s.lifecycleMu.Unlock()
+		return errors.New("websocket server already started")
+	}
+	s.httpServer = httpServer
+	s.lifecycleMu.Unlock()
+
 	log.Info("WebSocket 服务启动: addr=%s, path=/ws", s.WsPort)
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		s.lifecycleMu.Lock()
+		if !s.stopping {
+			s.httpServer = nil
+		}
+		s.lifecycleMu.Unlock()
 		log.Error("WebSocket 服务异常退出: addr=%s, err=%v", s.WsPort, err)
 		return err
 	}
@@ -597,37 +612,98 @@ func (s *WsServer) Start() error {
 	return nil
 }
 
-// Shutdown 优雅关闭服务
-func (s *WsServer) Shutdown(ctx context.Context) error {
-	if s.httpServer == nil {
-		log.Debug("服务尚未启动，无需关闭: addr=%s", s.WsPort)
-		return nil
+func (s *WsServer) serveWebSocket(w http.ResponseWriter, r *http.Request) {
+	s.lifecycleMu.Lock()
+	if s.stopping {
+		s.lifecycleMu.Unlock()
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
 	}
-	log.Info("开始优雅关闭 WebSocket 服务器...")
-	// 停止接受新连接
-	if err := s.httpServer.Shutdown(ctx); err != nil {
-		log.Error("httpServer.Shutdown 错误: %v", err)
-		return err
+	s.connectionsWG.Add(1)
+	s.lifecycleMu.Unlock()
+
+	writer := &websocketResponseWriter{ResponseWriter: w}
+	var tracked *Client
+	pumpsStarted := false
+	defer func() {
+		if pumpsStarted {
+			return
+		}
+		if tracked != nil {
+			tracked.closeNow()
+			s.finishConnection(tracked)
+		} else {
+			if writer.transport != nil {
+				_ = writer.transport.Close()
+			}
+			s.connectionsWG.Done()
+		}
+	}()
+
+	conn, err := websocket.Accept(writer, r, &s.acceptOptions)
+	if err != nil {
+		log.Warn("WebSocket 握手失败, remote=%s, origin=%s, err=%v",
+			r.RemoteAddr, r.Header.Get("Origin"), err)
+		return
 	}
-	log.Info("HTTP 层已关闭，等待所有 WebSocket 连接自然断开...")
-	// 注意：还需要主动关闭所有客户端连接，让它们在 writePump/readPump 中退出
-	s.closeAllClients()
-	log.Info("所有客户端连接已关闭")
-	return nil
+
+	connCtx, connCancel := context.WithCancel(context.Background())
+	client := &Client{
+		Conn:      conn,
+		Server:    s,
+		transport: writer.transport,
+		ctx:       connCtx,
+		cancel:    connCancel,
+		closeDone: make(chan struct{}),
+		SendCh:    make(chan []byte, 512),
+		pending:   make(map[string]chan *RPCMessage),
+		HandlerCh: make(chan RPCMessage, s.handlerQueue),
+	}
+
+	host, port, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		client.IP = host
+		if p, convErr := strconv.Atoi(port); convErr == nil {
+			client.Port = p
+		} else {
+			client.Port = -1
+		}
+	} else {
+		client.IP = r.RemoteAddr
+		client.Port = -1
+	}
+
+	tracked = client
+	// 升级和关停可能交叉，关停开始后立即放弃刚升级的连接。
+	s.lifecycleMu.Lock()
+	if s.stopping {
+		s.lifecycleMu.Unlock()
+		client.forceClose()
+		return
+	}
+	s.connections[client] = struct{}{}
+	s.lifecycleMu.Unlock()
+
+	conn.SetReadLimit(s.readLimit)
+	if err := client.authenticate(authWait); err != nil {
+		log.Warn("认证失败, IP: %s:%d, err: %v", client.IP, client.Port, err)
+		return
+	}
+
+	s.connMgr.register(client)
+	s.callClientReady(client)
+
+	pumpsStarted = true
+	go client.runPumps(s.readLimit, newInboundLimiter(s.messageRate, s.byteRate, s.readLimit))
 }
 
-// closeAllClients 遍历所有客户端并关闭连接
-func (s *WsServer) closeAllClients() {
-	s.idMapMu.RLock()
-	clients := make([]*Client, 0, len(s.clientIDMap))
-	for _, clt := range s.clientIDMap {
-		clients = append(clients, clt)
-	}
-	s.idMapMu.RUnlock()
-
-	for _, clt := range clients {
-		clt.CloseWithReason(websocket.StatusGoingAway, "server shutdown")
-	}
+func (c *Client) runPumps(readLimit int64, limiter inboundLimiter) {
+	defer c.Server.finishConnection(c)
+	var pumps sync.WaitGroup
+	pumps.Go(c.handlerPump)
+	pumps.Go(c.writePump)
+	c.readPump(readLimit, limiter)
+	pumps.Wait()
 }
 
 func (s *WsServer) callClientReady(c *Client) {
@@ -662,7 +738,8 @@ func (c *Client) authenticate(timeout time.Duration) error {
 	msgType, data, err := c.Conn.Read(ctx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			c.CloseWithReason(websocket.StatusPolicyViolation, "auth timeout")
+			// 未认证对端不会回应关闭帧，直接断开，避免为每条静默连接再等一次关闭握手。
+			c.closeNow()
 			return errors.New("auth timeout")
 		}
 		return fmt.Errorf("read auth message failed: %w", err)
@@ -688,19 +765,14 @@ func (c *Client) authenticate(timeout time.Duration) error {
 	}
 	c.codec = result.Codec
 
-	if err := c.registerAuthenticated(result.Type, result.ID); err != nil {
-		_ = c.sendAuthResponse(false, err.Error())
-		c.CloseWithReason(websocket.StatusPolicyViolation, "auth failed: "+err.Error())
-		return err
-	}
-
-	log.Info("客户端认证成功: 类型=%s, ID=%s, IP=%s:%d", result.Type, result.ID, c.IP, c.Port)
-
 	if err := c.sendAuthResponse(true, ""); err != nil {
-		c.removeFromPool()
 		return fmt.Errorf("send auth response failed: %w", err)
 	}
 
+	if !c.registerAuthenticated(result.Type, result.ID) {
+		return errors.New("server shutting down")
+	}
+	log.Info("客户端认证成功: 类型=%s, ID=%s, IP=%s:%d", c.Type, c.ID, c.IP, c.Port)
 	return nil
 }
 
@@ -722,30 +794,41 @@ func defaultAuthenticator(ctx context.Context, c *Client, data []byte) (*AuthRes
 	}, nil
 }
 
-func (c *Client) registerAuthenticated(clientType string, id string) error {
+func (c *Client) registerAuthenticated(clientType, id string) bool {
 	s := c.Server
-	var oldClient *Client
-
-	s.idMapMu.Lock()
-	if current, exists := s.clientIDMap[id]; exists && current != c {
-		oldClient = current
-		log.Warn("客户端ID %s 重新登录，新连接 %s:%d 将顶替旧连接 %s:%d",
-			id, c.IP, c.Port, current.IP, current.Port)
+	s.lifecycleMu.Lock()
+	if s.stopping {
+		s.lifecycleMu.Unlock()
+		return false
 	}
+	c.Type, c.ID = clientType, id
+
+	s.clientsMu.Lock()
+	oldClient := s.clientIDMap[id]
+	var kickOld bool
+	if oldClient != nil && oldClient != c {
+		s.removeFromTypePool(oldClient)
+		kickOld = oldClient.closing.CompareAndSwap(false, true)
+	}
+	if s.clientPool[clientType] == nil {
+		s.clientPool[clientType] = make(map[string]*Client)
+	}
+	s.clientPool[clientType][id] = c
 	s.clientIDMap[id] = c
-	s.idMapMu.Unlock()
+	s.clientsMu.Unlock()
+	s.lifecycleMu.Unlock()
 
-	c.addToPool(clientType, id)
-
-	if oldClient != nil {
-		oldClient.CloseWithReason(websocket.StatusPolicyViolation, "replaced by new connection")
+	if kickOld {
+		log.Warn("客户端ID %s 重新登录，新连接 %s:%d 将顶替旧连接 %s:%d",
+			id, c.IP, c.Port, oldClient.IP, oldClient.Port)
+		go oldClient.notifyKickedAndClose()
 	}
-	return nil
+	return true
 }
 
 // sendAuthResponse 向客户端发送认证结果。
 func (c *Client) sendAuthResponse(success bool, errMsg string) error {
-	if c.closed.Load() {
+	if c.closing.Load() {
 		log.Error("sendAuthResponse: client already closed, cannot send auth response (success=%v, err=%s)", success, errMsg)
 		return errors.New("client connection closed")
 	}
@@ -762,64 +845,80 @@ func (c *Client) sendAuthResponse(success bool, errMsg string) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
-	defer cancel()
-	if err := c.Conn.Write(ctx, websocket.MessageText, b); err != nil {
+	if err := c.writeText(b, 2*time.Second); err != nil {
 		log.Warn("发送认证响应失败: %v", err)
 		return err
 	}
 	return nil
 }
 
+func (c *Client) writeText(message []byte, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(c.ctx, timeout)
+	defer cancel()
+	return c.Conn.Write(ctx, websocket.MessageText, message)
+}
+
+// CloseWithReason 用指定的状态码关闭连接。
 func (c *Client) CloseWithReason(code websocket.StatusCode, text string) {
-	c.cancel()
+	if c.closing.CompareAndSwap(false, true) {
+		c.finishClose(code, text)
+	}
+}
+
+func (c *Client) closeNow() {
+	if c.closing.CompareAndSwap(false, true) {
+		defer close(c.closeDone)
+		defer c.cancel()
+		_ = c.Conn.CloseNow()
+	}
+}
+
+func (c *Client) finishClose(code websocket.StatusCode, text string) {
+	// 取消正在读写的 context 会直接断开底层连接，关闭握手结束后再取消。
+	defer close(c.closeDone)
+	defer c.cancel()
 	_ = c.Conn.Close(code, text)
 }
 
-// 添加到对应类型的数组
-func (c *Client) addToPool(clientType string, ID string) {
-	c.Type = clientType
-	c.ID = ID
-	s := c.Server
-	s.poolMu.Lock()
-	defer s.poolMu.Unlock()
+func (c *Client) notifyKickedAndClose() {
+	defer c.finishClose(websocket.StatusPolicyViolation, "replaced by new connection")
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("发送顶号通知时发生 panic: client=%s, panic=%v", c.ID, r)
+		}
+	}()
 
-	if _, ok := s.clientPool[clientType]; !ok {
-		s.clientPool[clientType] = make(map[string]*Client)
+	// 直接写出通知，避免被普通业务发送队列挡住。
+	message, err := c.marshalRPCMessage(RPCMessage{Method: "session.kicked", Error: "kicked"})
+	if err == nil {
+		err = c.writeText(message, 2*time.Second)
 	}
-	s.clientPool[clientType][ID] = c
+	if err != nil {
+		log.Warn("发送顶号通知失败: client=%s, err=%v", c.ID, err)
+	}
 }
 
-// 从数组中移除（在 defer 中调用）
-func (c *Client) removeFromPool() {
-	// 连接已断开，立即让所有未完成的 Call 失败
-	c.cleanPendingWithError("connection lost")
-
-	if c.Type == "" {
-		return
-	}
-	s := c.Server
-	s.idMapMu.Lock()
-	// 只有当 Map 里存的那个 Client 指针还是“我”自己时，我才去删它
-	if current, exists := s.clientIDMap[c.ID]; exists && current == c {
-		delete(s.clientIDMap, c.ID)
-		log.Info("客户端ID %s 正常下线，清理完成", c.ID)
-	} else {
-		// 如果 current != c，说明 map 已经被新启动的连接覆盖了
-		log.Info("客户端ID %s 已被新实例替换，跳过 Map 清理", c.ID)
-	}
-	s.idMapMu.Unlock()
-
-	s.poolMu.Lock()
-	defer s.poolMu.Unlock()
-
-	if clients, ok := s.clientPool[c.Type]; ok {
-		// 关键点：依然要校验指针，防止误删新重连的实例
-		if current, exists := clients[c.ID]; exists && current == c {
-			delete(clients, c.ID)
-			log.Info("客户端已从池中移除: ID %s", c.ID)
+// removeFromTypePool 只移除仍指向该连接的条目。调用方须持有 clientsMu 写锁。
+func (s *WsServer) removeFromTypePool(c *Client) {
+	clients := s.clientPool[c.Type]
+	if clients[c.ID] == c {
+		delete(clients, c.ID)
+		if len(clients) == 0 {
+			delete(s.clientPool, c.Type)
 		}
 	}
+}
+
+func (c *Client) removeFromPool() {
+	c.cleanPendingWithError("connection lost")
+
+	s := c.Server
+	s.clientsMu.Lock()
+	if s.clientIDMap[c.ID] == c {
+		delete(s.clientIDMap, c.ID)
+	}
+	s.removeFromTypePool(c)
+	s.clientsMu.Unlock()
 }
 
 // cleanPendingWithError 清理所有未完成的 Call，并返回指定错误
@@ -855,6 +954,9 @@ func (c *Client) handlerPump() {
 		case <-c.ctx.Done():
 			return
 		case msg := <-c.HandlerCh:
+			if c.closing.Load() {
+				return
+			}
 			c.dispatchTextMessage(c.ctx, msg)
 		}
 	}
@@ -930,8 +1032,8 @@ func (s *WsServer) RegisterDefaultHandler(handler Handler) {
 
 // GetClientByID 根据客户端ID获取Client指针（并发安全）
 func (s *WsServer) GetClientByID(clientID string) (*Client, bool) {
-	s.idMapMu.RLock()
-	defer s.idMapMu.RUnlock()
+	s.clientsMu.RLock()
+	defer s.clientsMu.RUnlock()
 	client, ok := s.clientIDMap[clientID]
 	return client, ok
 }
@@ -953,9 +1055,7 @@ func CallT[T any](c *Client, method string, arg any) (*T, json.RawMessage, *Clie
 }
 
 func CallByID[T any](s *WsServer, clientID string, method string, arg any) (*T, json.RawMessage, *Client, error) {
-	s.idMapMu.RLock()
-	c, exists := s.clientIDMap[clientID]
-	s.idMapMu.RUnlock()
+	c, exists := s.GetClientByID(clientID)
 
 	if !exists {
 		return nil, nil, nil, fmt.Errorf("no client found for id: %s", clientID)
@@ -964,9 +1064,7 @@ func CallByID[T any](s *WsServer, clientID string, method string, arg any) (*T, 
 }
 
 func (s *WsServer) SendByID(clientID string, method string, arg any) error {
-	s.idMapMu.RLock()
-	c, exists := s.clientIDMap[clientID]
-	s.idMapMu.RUnlock()
+	c, exists := s.GetClientByID(clientID)
 
 	if !exists {
 		return fmt.Errorf("no client found for id: %s", clientID)
@@ -975,23 +1073,17 @@ func (s *WsServer) SendByID(clientID string, method string, arg any) error {
 }
 
 func (s *WsServer) HasClient(clientType string) bool {
-	// 1. 加读锁，保证在获取切片时数据不会被其他协程修改
-	s.poolMu.RLock()
-	defer s.poolMu.RUnlock()
-	clients, exists := s.clientPool[clientType]
-	// 如果该类型不存在，或者切片为空，直接解锁并返回
-	if !exists || len(clients) == 0 {
-		return false
-	}
-	return true
+	s.clientsMu.RLock()
+	defer s.clientsMu.RUnlock()
+	return len(s.clientPool[clientType]) != 0
 }
 
 // WalkClient 遍历指定类型的客户端
 func (s *WsServer) WalkClient(clientType string, f func(clt *Client)) bool {
-	s.poolMu.RLock()
+	s.clientsMu.RLock()
 	typeMap, exists := s.clientPool[clientType]
 	if !exists || len(typeMap) == 0 {
-		s.poolMu.RUnlock()
+		s.clientsMu.RUnlock()
 		return false
 	}
 
@@ -1000,7 +1092,7 @@ func (s *WsServer) WalkClient(clientType string, f func(clt *Client)) bool {
 	for _, clt := range typeMap {
 		clients = append(clients, clt)
 	}
-	s.poolMu.RUnlock() // 拷贝完立即释放锁
+	s.clientsMu.RUnlock() // 拷贝完立即释放锁
 
 	// 在无锁状态下执行回调
 	for _, clt := range clients {

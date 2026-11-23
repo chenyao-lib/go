@@ -44,6 +44,13 @@
 // Call 在等待目标服务时会临时释放当前服务的执行令牌，返回后再恢复，避免服务间
 // 同步调用把当前队列永久阻塞。调用方仍应避免形成循环等待。
 //
+// Call 和 Sleep 必须由上下文所属的 Service 接收：在 A 的 Handler 里调用
+// a.Call/a.Sleep。用其他服务的 ctx 调用、handler 返回后继续使用 ctx、或同一
+// ctx 被并发用于 Call/Sleep 都会被拒绝：Call 返回 ErrTokenNotOwned/
+// ErrHandlerFinished/ErrTokenAlreadyReleased，Sleep 记录错误日志并跳过令牌释放。
+//
+// RawCall、Call 和 RawSend 将传入的上下文传播给 Handler，并应用配置的处理时限。
+// RawSend 入队后，上下文仍须在异步处理期间有效。
 // RawCall、Call、RawSend 和 Send 都可能返回队列满、服务停止或超时错误；应使用
 // errors.Is 判断 ErrQueueFull、ErrCallTimeout 等预定义错误。
 //
@@ -80,6 +87,10 @@ var (
 	ErrCallTimeout       = errors.New("call timeout")
 	ErrCallerNotRunning  = errors.New("caller service is not running")
 	ErrExternalOnly      = errors.New("external entry cannot be used inside service handler")
+
+	ErrTokenNotOwned        = errors.New("handler context belongs to another service")
+	ErrHandlerFinished      = errors.New("handler context is already finished")
+	ErrTokenAlreadyReleased = errors.New("handler context is already used by another Call/Sleep")
 )
 
 // ==================== 服务状态 ====================
@@ -123,12 +134,30 @@ type ServiceMsg struct {
 	Error   error  `json:"-"`
 	IsRsp   bool   `json:"-"`
 
+	ctx   context.Context
 	rspCh chan *ServiceMsg `json:"-"`
 }
 
 // ==================== context 标记 ====================
 
 type handlerCtxKey struct{}
+
+// handlerExecState 记录 handler 上下文的属主与执行令牌状态。
+// released 防止同一上下文的并发 Call/Sleep 重复释放令牌；
+// done 在 handler 返回后置位，阻止派生 goroutine 继续借用该上下文。
+type handlerExecState struct {
+	owner    *Service
+	released atomic.Bool
+	done     atomic.Bool
+}
+
+func handlerStateFromContext(ctx context.Context) *handlerExecState {
+	if ctx == nil {
+		return nil
+	}
+	state, _ := ctx.Value(handlerCtxKey{}).(*handlerExecState)
+	return state
+}
 
 // ==================== Handler 与服务定义 ====================
 
@@ -420,7 +449,9 @@ func (s *Service) runInit() error {
 	<-s.execToken
 	defer func() { s.execToken <- struct{}{} }()
 
-	ctx := context.WithValue(context.Background(), handlerCtxKey{}, true)
+	state := &handlerExecState{owner: s}
+	defer state.done.Store(true)
+	ctx := context.WithValue(context.Background(), handlerCtxKey{}, state)
 
 	s.Info("initializing...")
 
@@ -494,13 +525,15 @@ func (s *Service) loop() {
 			select {
 			case <-s.execToken:
 			case <-s.quit:
+				// 已经取出的消息不在 msgCh 里，必须一并交给 drain，否则停止时会静默丢失。
+				s.drainRemaining(msg)
 				return
 			}
 
 			s.startHandler(msg)
 
 		case <-s.quit:
-			s.drainRemaining()
+			s.drainRemaining(nil)
 			return
 		}
 	}
@@ -524,6 +557,10 @@ func (s *Service) startHandler(msg *ServiceMsg) {
 }
 
 func (s *Service) handleOne(msg *ServiceMsg) {
+	if msg.ctx != nil && msg.ctx.Err() != nil {
+		return
+	}
+
 	start := time.Now()
 	var panicErr error
 
@@ -544,9 +581,11 @@ func (s *Service) handleOne(msg *ServiceMsg) {
 		}
 
 		timeout := s.handlerTimeout(msg.Method)
-		ctx, cancel := s.handlerContext(timeout)
+		ctx, cancel := s.handlerContext(msg.ctx, timeout)
 		defer cancel()
-		ctx = context.WithValue(ctx, handlerCtxKey{}, true)
+		state := &handlerExecState{owner: s}
+		defer state.done.Store(true)
+		ctx = context.WithValue(ctx, handlerCtxKey{}, state)
 
 		res, err := handler(ctx, msg.Data)
 
@@ -591,11 +630,14 @@ func (s *Service) callTimeout(method string) time.Duration {
 	return s.config.CallTimeout
 }
 
-func (s *Service) handlerContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	if timeout <= 0 {
-		return context.WithCancel(context.Background())
+func (s *Service) handlerContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
 	}
-	return context.WithTimeout(context.Background(), timeout)
+	if timeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, timeout)
 }
 
 func (s *Service) sendResponse(msg *ServiceMsg, data any, err error) {
@@ -612,34 +654,38 @@ func (s *Service) sendResponse(msg *ServiceMsg, data any, err error) {
 	}
 }
 
-func (s *Service) drainRemaining() {
+func (s *Service) drainRemaining(pending *ServiceMsg) {
 	deadline := time.Now().Add(s.config.DrainTimeout)
 	drained := 0
+	msg := pending
 
 	for {
+		if msg == nil {
+			select {
+			case next := <-s.msgCh:
+				msg = next
+			default:
+				s.Info("drained %d messages", drained)
+				return
+			}
+		}
+
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			left := len(s.msgCh)
-			if left > 0 {
-				s.Warn("drain timeout: %d messages dropped", left)
-			}
+			s.Warn("drain timeout: %d messages dropped", len(s.msgCh)+1)
 			return
 		}
 
 		select {
-		case msg := <-s.msgCh:
-			select {
-			case <-s.execToken:
-			case <-time.After(remaining):
-				return
-			}
-
-			drained++
-			s.startHandler(msg)
-		default:
-			s.Info("drained %d messages", drained)
+		case <-s.execToken:
+		case <-time.After(remaining):
+			s.Warn("drain timeout: %d messages dropped", len(s.msgCh)+1)
 			return
 		}
+
+		drained++
+		s.startHandler(msg)
+		msg = nil
 	}
 }
 
@@ -672,12 +718,38 @@ func (s *Service) Call(ctx context.Context, targetService, method string, args a
 		return nil, fmt.Errorf("%w: %s (state=%d)", ErrServiceNotRunning, targetService, target.state.Load())
 	}
 
-	if ctx.Value(handlerCtxKey{}) != nil {
-		s.releaseExecToken()
-		defer s.acquireExecToken()
+	if state := handlerStateFromContext(ctx); state != nil {
+		if err := s.claimHandlerToken(state); err != nil {
+			return nil, err
+		}
+		defer s.releaseHandlerToken(state)
 	}
 
 	return target.rawCall(ctx, method, args)
+}
+
+// claimHandlerToken 校验上下文属于 s 且尚未被并发使用，然后临时释放执行令牌。
+func (s *Service) claimHandlerToken(state *handlerExecState) error {
+	if state.owner != s {
+		owner := "<nil>"
+		if state.owner != nil {
+			owner = state.owner.name
+		}
+		return fmt.Errorf("%w: ctx owner is %q", ErrTokenNotOwned, owner)
+	}
+	if state.done.Load() {
+		return ErrHandlerFinished
+	}
+	if !state.released.CompareAndSwap(false, true) {
+		return ErrTokenAlreadyReleased
+	}
+	s.releaseExecToken()
+	return nil
+}
+
+func (s *Service) releaseHandlerToken(state *handlerExecState) {
+	s.acquireExecToken()
+	state.released.Store(false)
 }
 
 func (s *Service) releaseExecToken() {
@@ -702,7 +774,9 @@ func (s *Service) rawCall(parent context.Context, method string, args any) (any,
 		Session: session,
 		Method:  method,
 		Data:    args,
-		rspCh:   rspCh,
+		// Handler 继承调用方的上下文，CallTimeout 仍只约束等响应的时间。
+		ctx:   parent,
+		rspCh: rspCh,
 	}
 
 	select {
@@ -750,9 +824,12 @@ func (s *Service) Sleep(ctx context.Context, d time.Duration) {
 		return
 	}
 
-	if ctx.Value(handlerCtxKey{}) != nil {
-		s.releaseExecToken()
-		defer s.acquireExecToken()
+	if state := handlerStateFromContext(ctx); state != nil {
+		if err := s.claimHandlerToken(state); err != nil {
+			s.Error("sleep rejected: %v", err)
+		} else {
+			defer s.releaseHandlerToken(state)
+		}
 	}
 
 	select {
@@ -767,13 +844,19 @@ func (s *Service) RawSend(ctx context.Context, method string, args any) error {
 	if s.state.Load() != int32(StateRunning) {
 		return ErrServiceNotRunning
 	}
-	if ctx != nil && ctx.Value(handlerCtxKey{}) != nil {
-		return ErrExternalOnly
+	if ctx != nil {
+		if ctx.Value(handlerCtxKey{}) != nil {
+			return ErrExternalOnly
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 
 	msg := &ServiceMsg{
 		Method: method,
 		Data:   args,
+		ctx:    ctx,
 	}
 
 	select {

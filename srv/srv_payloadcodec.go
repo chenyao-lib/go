@@ -24,7 +24,7 @@ func (c *Client) marshalRPCMessage(msg RPCMessage) ([]byte, error) {
 	return json.Marshal(msg)
 }
 
-func (c *Client) decodeRPCMessage(msg *RPCMessage) error {
+func (c *Client) decodeRPCMessage(msg *RPCMessage, readLimit int64) error {
 	if c.codec == nil {
 		return nil
 	}
@@ -32,6 +32,10 @@ func (c *Client) decodeRPCMessage(msg *RPCMessage) error {
 	plaintext, err := c.codec.Decode(c.payloadMeta(*msg, payloadcodec.ClientToServer), msg.Data)
 	if err != nil {
 		return fmt.Errorf("decode rpc payload: %w", err)
+	}
+	messageSize := int64(len(plaintext)) + int64(len(msg.Method)) + int64(len(msg.Session)) + int64(len(msg.Error))
+	if messageSize > readLimit {
+		return fmt.Errorf("decoded RPC message exceeds %d bytes", readLimit)
 	}
 	msg.Data = append(json.RawMessage(nil), plaintext...)
 	return nil

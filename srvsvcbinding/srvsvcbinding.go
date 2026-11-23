@@ -30,6 +30,7 @@
 // 带 Session 的客户端消息通过 Instance.RawCall 分发，Handler 返回值会作为 RPC
 // 响应发回客户端；Session 为空的消息通过 Instance.RawSend 分发，不等待业务
 // 返回值。客户端 method 必须与该连接 Service 的 Handler 名称一致。
+// 分发使用连接上下文，连接关闭时会取消消息守卫和 svc.Service 的业务 Handler。
 //
 // # 中间件
 //
@@ -267,7 +268,7 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 		return nil, err
 	}
 
-	ctx := context.Background()
+	ctx := c.Context()
 	for _, middleware := range readyMiddlewares {
 		if err := middleware.BeforeMessage(ctx, c, msg); err != nil {
 			log.Warn(

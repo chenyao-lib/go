@@ -56,10 +56,10 @@
 // 服务端明确拒绝认证（AuthResponse.OK=false）时 Start 会返回并永久停止；
 // 网络错误、读写超时、响应格式错误等临时故障会按指数退避继续重试。
 //
-// 心跳间隔、控制帧写超时、默认调用超时、单方法调用超时和处理队列容量都应在
-// Start 前配置。SetReadDeadline 仅为兼容保留，coder/websocket 不支持单连接
-// 读超时，调用不会生效。WaitStopSignal 是命令行程序等待 SIGINT/SIGTERM 并
-// 清理客户端的便捷入口。
+// 心跳间隔、拨号超时、控制帧写超时、默认调用超时、单方法调用超时和处理队列
+// 容量都应在 Start 前配置。SetReadDeadline 仅为兼容保留，coder/websocket 不
+// 支持单连接读超时，调用不会生效。WaitStopSignal 是命令行程序等待
+// SIGINT/SIGTERM 并清理客户端的便捷入口。
 package clt
 
 import (
@@ -97,6 +97,10 @@ const defaultHandlerQueue = 256
 
 const defaultHeartbeatInterval = 20 * time.Second
 
+const defaultDialTimeout = 10 * time.Second
+
+const defaultSendQueue = 100
+
 // ErrAuthRejected 表示服务端明确拒绝了认证信息（AuthResponse.OK=false）。
 // 该错误不可重试；网络错误、超时和响应格式错误不属于此错误，Start 会继续重试。
 var ErrAuthRejected = errors.New("authentication rejected by server")
@@ -110,7 +114,7 @@ type WSClient struct {
 	Conn       *websocket.Conn
 	IP         string
 	Port       int
-	SendCh     chan []byte
+	SendCh     chan []byte // 当前连接的发送队列，每次重连更换
 	Ctx        context.Context
 	Cancel     context.CancelFunc
 	mu         sync.RWMutex
@@ -125,7 +129,7 @@ type WSClient struct {
 	// handlers 存储 method 到 函数的映射
 	handlers         map[string]func(clt *WSClient, data json.RawMessage) (any, error)
 	handlersMu       sync.RWMutex
-	HandlerCh        chan RPCMessage
+	HandlerCh        chan RPCMessage // 当前连接的服务端请求队列，每次重连更换
 	handlerQueueSize atomic.Int64
 
 	closed              atomic.Bool  // 标记是否已彻底关闭
@@ -133,6 +137,7 @@ type WSClient struct {
 	writeTimeout        atomic.Int64 // 写超时，默认5秒
 	defaultCallTimeout  atomic.Int64 // Call 默认超时，默认5秒
 	heartbeatInterval   atomic.Int64 // 心跳发送间隔，默认 20 秒
+	dialTimeout         atomic.Int64 // 单次拨号超时，默认 10 秒
 	readDeadline        atomic.Int64 // 读超时时间，默认 30 秒
 	controlWriteTimeout atomic.Int64 // 控制帧写超时（Ping/Close），默认 2 秒
 	authPayload         AuthPayloadFunc
@@ -150,7 +155,7 @@ type AuthResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-func (c *WSClient) readPump(ctx context.Context, conn *websocket.Conn, cancel context.CancelFunc, wg *sync.WaitGroup) {
+func (c *WSClient) readPump(ctx context.Context, conn *websocket.Conn, handlerCh chan RPCMessage, sendCh chan []byte, cancel context.CancelFunc, wg *sync.WaitGroup) {
 	defer func() {
 		cancel()
 		wg.Done()
@@ -194,6 +199,13 @@ func (c *WSClient) readPump(ctx context.Context, conn *websocket.Conn, cancel co
 					c.ClientId, msg.Method, msg.Session, err)
 				continue
 			}
+			if msg.Method == "session.kicked" && msg.Session == "" {
+				log.Warn("会话已被新连接替换，停止重连: client=%s", c.ClientId)
+				c.closed.Store(true)
+				c.cleanPendingWithError("session kicked")
+				c.Cancel()
+				return
+			}
 			if c.otherResponse(&msg) {
 				continue
 			}
@@ -201,7 +213,7 @@ func (c *WSClient) readPump(ctx context.Context, conn *websocket.Conn, cancel co
 				log.Error("没有处理方法: %s", string(data))
 				continue
 			}
-			c.enqueueTextMessage(ctx, msg)
+			c.enqueueTextMessage(ctx, handlerCh, sendCh, msg)
 
 		case websocket.MessageBinary:
 			log.Info("收到二进制，大小为: %d 字节", len(data))
@@ -209,7 +221,7 @@ func (c *WSClient) readPump(ctx context.Context, conn *websocket.Conn, cancel co
 	}
 }
 
-func (c *WSClient) writePump(ctx context.Context, conn *websocket.Conn, wg *sync.WaitGroup) {
+func (c *WSClient) writePump(ctx context.Context, conn *websocket.Conn, sendCh <-chan []byte, wg *sync.WaitGroup) {
 	ticker := time.NewTicker(c.heartbeatPeriod())
 	defer func() {
 		ticker.Stop()
@@ -223,7 +235,7 @@ func (c *WSClient) writePump(ctx context.Context, conn *websocket.Conn, wg *sync
 			// 退出前优雅关闭协议连接
 			_ = conn.Close(websocket.StatusNormalClosure, "")
 			return
-		case msg, ok := <-c.SendCh:
+		case msg, ok := <-sendCh:
 			if !ok {
 				return
 			}
@@ -246,14 +258,23 @@ func (c *WSClient) writePump(ctx context.Context, conn *websocket.Conn, wg *sync
 	}
 }
 
+// sendQueue 返回当前连接的发送队列。队列随连接更换，断线期间排队的消息和
+// 旧连接处理器迟到的响应不会被下一次连接消费。
+func (c *WSClient) sendQueue() (chan []byte, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.isReady || c.Conn == nil || c.SendCh == nil {
+		return nil, false
+	}
+	return c.SendCh, true
+}
+
 func (c *WSClient) Send(method string, arg any) error {
 	// 连接状态检查
 	if c.closed.Load() {
 		return errors.New("client already closed")
 	}
-	c.mu.RLock()
-	ready := c.isReady && c.Conn != nil
-	c.mu.RUnlock()
+	sendCh, ready := c.sendQueue()
 	if !ready {
 		return errors.New("connection is not ready, reconnecting")
 	}
@@ -275,7 +296,7 @@ func (c *WSClient) Send(method string, arg any) error {
 	}
 
 	select {
-	case c.SendCh <- b:
+	case sendCh <- b:
 		return nil
 	default:
 		// 通道满，再检查是否因为 ctx 取消导致
@@ -293,9 +314,7 @@ func (c *WSClient) Call(method string, arg any) (json.RawMessage, error) {
 	if c.closed.Load() {
 		return nil, errors.New("client already closed")
 	}
-	c.mu.RLock()
-	ready := c.isReady && c.Conn != nil
-	c.mu.RUnlock()
+	sendCh, ready := c.sendQueue()
 	if !ready {
 		return nil, errors.New("connection is not ready, reconnecting")
 	}
@@ -338,7 +357,7 @@ func (c *WSClient) Call(method string, arg any) (json.RawMessage, error) {
 	}
 
 	select {
-	case c.SendCh <- b:
+	case sendCh <- b:
 	case <-ctx.Done():
 		return nil, c.callDoneError(ctx, "send request timeout")
 	}
@@ -401,17 +420,11 @@ func (c *WSClient) otherResponse(msg *RPCMessage) bool {
 	return false
 }
 
-func (c *WSClient) meResponse(session string, data any, err error) {
-	// 如果客户端已彻底关闭，直接返回，避免向已关闭的 SendCh 发送
-	if c.closed.Load() {
-		return
-	}
-
-	c.mu.RLock()
-	ready := c.isReady && c.Conn != nil
-	c.mu.RUnlock()
-	if !ready {
-		log.Warn("meResponse: connection not ready, drop response for session %s", session)
+// meResponse 把服务端请求的处理结果写回收到该请求的连接。sendCh 必须是本次
+// 连接的发送队列，不能重新读取客户端当前队列，否则旧连接处理器迟到的响应
+// 会被发到重连后的新连接。
+func (c *WSClient) meResponse(ctx context.Context, sendCh chan<- []byte, session string, data any, err error) {
+	if ctx.Err() != nil || sendCh == nil {
 		return
 	}
 
@@ -433,11 +446,11 @@ func (c *WSClient) meResponse(session string, data any, err error) {
 				return
 			}
 			select {
-			case c.SendCh <- b:
+			case sendCh <- b:
 			case <-time.After(time.Duration(c.writeTimeout.Load())):
 				log.Warn("meResponse: send response timeout for session %s", session)
-			case <-c.Ctx.Done():
-				log.Warn("meResponse: client closing, drop response for session %s", session)
+			case <-ctx.Done():
+				log.Warn("meResponse: connection closed, drop response for session %s", session)
 			}
 			return
 		}
@@ -456,11 +469,11 @@ func (c *WSClient) meResponse(session string, data any, err error) {
 		return
 	}
 	select {
-	case c.SendCh <- b:
+	case sendCh <- b:
 	case <-time.After(time.Duration(c.writeTimeout.Load())):
 		log.Warn("meResponse: send response timeout for session %s", session)
-	case <-c.Ctx.Done():
-		log.Warn("meResponse: client closing, drop response for session %s", session)
+	case <-ctx.Done():
+		log.Warn("meResponse: connection closed, drop response for session %s", session)
 	}
 }
 
@@ -481,6 +494,15 @@ func (c *WSClient) heartbeatPeriod() time.Duration {
 	return period
 }
 
+// dialTimeoutPeriod 返回单次拨号超时；非法值回退默认值。
+func (c *WSClient) dialTimeoutPeriod() time.Duration {
+	timeout := time.Duration(c.dialTimeout.Load())
+	if timeout <= 0 {
+		return defaultDialTimeout
+	}
+	return timeout
+}
+
 // NewClient 初始化客户端（在这里绑定 Context）
 func NewClient(ctx context.Context, host string, clientType string, clientId string) *WSClient {
 	// 创建一个继承自传入 ctx 的子 context
@@ -496,7 +518,7 @@ func NewClient(ctx context.Context, host string, clientType string, clientId str
 		Addr:         addr,
 		ClientType:   clientType,
 		ClientId:     clientId,
-		SendCh:       make(chan []byte, 100),
+		SendCh:       make(chan []byte, defaultSendQueue),
 		Ctx:          cCtx,
 		Cancel:       cCancel,
 		pending:      make(map[string]chan *RPCMessage),
@@ -510,6 +532,7 @@ func NewClient(ctx context.Context, host string, clientType string, clientId str
 	c.writeTimeout.Store(int64(5 * time.Second))
 	c.defaultCallTimeout.Store(int64(5 * time.Second))
 	c.heartbeatInterval.Store(int64(defaultHeartbeatInterval))
+	c.dialTimeout.Store(int64(defaultDialTimeout))
 	c.readDeadline.Store(int64(30 * time.Second))
 	c.controlWriteTimeout.Store(int64(2 * time.Second))
 	c.authPayload = defaultAuthPayload
@@ -568,6 +591,8 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 	const (
 		minBackoff = 1 * time.Second
 		maxBackoff = 60 * time.Second
+		// 连接存活不足该时长视为失败，避免"认证成功即被断开"造成 1 秒级重连循环。
+		stableConnection = 10 * time.Second
 	)
 	var consecutiveFailures int // 连续失败次数
 
@@ -603,7 +628,9 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 		}
 
 		log.Info("正在连接: %s", c.Addr)
-		conn, _, err := websocket.Dial(c.Ctx, c.Addr, nil)
+		dialCtx, dialCancel := context.WithTimeout(c.Ctx, c.dialTimeoutPeriod())
+		conn, _, err := websocket.Dial(dialCtx, c.Addr, nil)
+		dialCancel()
 		if err != nil {
 			consecutiveFailures++
 			log.Info("连接失败: %v", err)
@@ -627,19 +654,21 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 			continue
 		}
 
-		// 连接成功，重置失败计数
-		consecutiveFailures = 0
+		// 认证成功，但先不清零失败计数：只有连接稳定存活后才算真正连上。
+		connectedAt := time.Now()
 
 		connCtx, connCancel := context.WithCancel(c.Ctx)
 		var connWG sync.WaitGroup
 		connDone := make(chan struct{})
 		handlerCh := make(chan RPCMessage, c.handlerQueueCap())
-		connWG.Add(2)
+		sendCh := make(chan []byte, defaultSendQueue)
+		connWG.Add(3)
 
 		c.mu.Lock()
 		c.Conn = conn
 		c.connDone = connDone
 		c.HandlerCh = handlerCh
+		c.SendCh = sendCh
 		u, parseErr := url.Parse(c.Addr)
 		if parseErr == nil {
 			host, port, splitErr := net.SplitHostPort(u.Host)
@@ -663,9 +692,9 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 
 		log.Info("已连接到服务器: %s, IP地址：%s:%d", c.Addr, c.IP, c.Port)
 
-		go c.readPump(connCtx, conn, connCancel, &connWG)
-		go c.writePump(connCtx, conn, &connWG)
-		go c.handlerPump(connCtx, handlerCh)
+		go c.readPump(connCtx, conn, handlerCh, sendCh, connCancel, &connWG)
+		go c.writePump(connCtx, conn, sendCh, &connWG)
+		go c.handlerPump(connCtx, handlerCh, sendCh, &connWG)
 		go func() {
 			connWG.Wait()
 			close(connDone)
@@ -689,10 +718,6 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 		c.isReady = false
 		c.mu.Unlock()
 
-		for len(c.SendCh) > 0 {
-			<-c.SendCh
-		}
-
 		select {
 		case <-c.Ctx.Done():
 			// 彻底关闭，等待协程退出（带超时）
@@ -700,6 +725,12 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 			log.Info("不再重连：客户端已彻底关闭")
 			return
 		default:
+			if lifetime := time.Since(connectedAt); lifetime >= stableConnection {
+				consecutiveFailures = 0
+			} else {
+				consecutiveFailures++
+				log.Warn("连接存活时间过短(%v)，按失败重连处理 (连续失败 %d 次)", lifetime, consecutiveFailures)
+			}
 			// 等待旧连接协程退出后再重连，增加超时保护
 			c.waitDoneWithTimeout(connDone, 2*time.Second, "等待旧连接协程退出超时，强制继续重连")
 			log.Info("🔄 连接异常断开，准备重连...")
@@ -793,6 +824,16 @@ func (c *WSClient) SetHeartbeatInterval(d time.Duration) {
 	c.heartbeatInterval.Store(int64(d))
 }
 
+// SetDialTimeout 设置单次 WebSocket 拨号（TCP 连接 + TLS + 握手）超时，
+// 非正值会被忽略。运行期间修改从下一次拨号开始生效。
+func (c *WSClient) SetDialTimeout(d time.Duration) {
+	if d <= 0 {
+		log.Warn("忽略非法拨号超时: %v", d)
+		return
+	}
+	c.dialTimeout.Store(int64(d))
+}
+
 func (c *WSClient) SetControlWriteTimeout(d time.Duration) {
 	c.controlWriteTimeout.Store(int64(d))
 }
@@ -871,29 +912,26 @@ func defaultAuthPayload(c *WSClient) (any, error) {
 	}, nil
 }
 
-func (c *WSClient) enqueueTextMessage(ctx context.Context, msg RPCMessage) {
-	c.mu.RLock()
-	handlerCh := c.HandlerCh
-	c.mu.RUnlock()
-
+func (c *WSClient) enqueueTextMessage(ctx context.Context, handlerCh chan RPCMessage, sendCh chan []byte, msg RPCMessage) {
 	select {
 	case handlerCh <- msg:
 	default:
 		err := fmt.Errorf("handler queue full")
 		log.Warn("drop request: %v, method=%s, session=%s", err, msg.Method, msg.Session)
-		if msg.Session != "" && ctx.Err() == nil {
-			c.meResponse(msg.Session, nil, err)
+		if msg.Session != "" {
+			c.meResponse(ctx, sendCh, msg.Session, nil, err)
 		}
 	}
 }
 
-func (c *WSClient) handlerPump(ctx context.Context, handlerCh <-chan RPCMessage) {
+func (c *WSClient) handlerPump(ctx context.Context, handlerCh <-chan RPCMessage, sendCh chan []byte, wg *sync.WaitGroup) {
+	defer wg.Done()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case msg := <-handlerCh:
-			c.dispatchTextMessage(ctx, msg)
+			c.dispatchTextMessage(ctx, sendCh, msg)
 		}
 	}
 }
@@ -906,12 +944,12 @@ func (c *WSClient) handlerQueueCap() int {
 	return int(n)
 }
 
-func (c *WSClient) dispatchTextMessage(ctx context.Context, msg RPCMessage) {
+func (c *WSClient) dispatchTextMessage(ctx context.Context, sendCh chan []byte, msg RPCMessage) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("handler panic recovered: method=%s, panic=%v", msg.Method, r)
-			if msg.Session != "" && ctx.Err() == nil {
-				c.meResponse(msg.Session, nil, fmt.Errorf("handler panic: %v", r))
+			if msg.Session != "" {
+				c.meResponse(ctx, sendCh, msg.Session, nil, fmt.Errorf("handler panic: %v", r))
 			}
 		}
 	}()
@@ -922,7 +960,7 @@ func (c *WSClient) dispatchTextMessage(ctx context.Context, msg RPCMessage) {
 		return
 	}
 	if msg.Session != "" {
-		c.meResponse(msg.Session, &rsp, err)
+		c.meResponse(ctx, sendCh, msg.Session, &rsp, err)
 	}
 }
 
