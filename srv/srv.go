@@ -102,9 +102,10 @@ type WsServer struct {
 	WsPort  string
 	connMgr *ConnManager
 
-	clientsMu   sync.RWMutex // 同时保护两个连接索引
-	clientPool  map[string]map[string]*Client
-	clientIDMap map[string]*Client
+	clientsMu     sync.RWMutex // 保护连接索引和待就绪的认证顺序
+	clientPool    map[string]map[string]*Client
+	clientIDMap   map[string]*Client
+	sessionOrders map[string]*sessionOrder
 
 	handlers       map[string]map[string]Handler
 	defaultHandler Handler
@@ -139,6 +140,12 @@ type AuthResult struct {
 
 type Authenticator func(ctx context.Context, c *Client, data []byte) (*AuthResult, error)
 type ClientHook func(c *Client)
+
+type sessionOrder struct {
+	lastAuthenticated uint64
+	lastReady         uint64
+	pending           int
+}
 
 // SetOriginPatterns 配置允许跨域访问 WebSocket 的 Origin 白名单。
 // 不配置时默认允许所有 Origin，以保持 NewServer 的开箱即用行为。
@@ -187,6 +194,8 @@ func (s *WsServer) SetAuthenticator(authenticator Authenticator) {
 }
 
 // SetOnClientReady 注册认证成功回调。回调完成后才发布连接、替换旧会话和分发业务消息。
+// 回调内请使用传入的 c.Send 给本次连接发消息，消息会在连接就绪后写出。
+// 此时 GetClientByID 和 SendByID 查找的是已就绪的会话，可能仍指向旧连接。
 // 回调可调用 CloseWithReason 拒绝新连接。Shutdown 会等待回调返回。
 func (s *WsServer) SetOnClientReady(fn ClientHook) {
 	s.onClientReady = fn
@@ -226,18 +235,20 @@ type AuthResponse struct {
 type Handler func(clt *Client, msg RPCMessage) (any, error)
 
 type Client struct {
-	Conn      *websocket.Conn
-	Server    *WsServer // 反向引用所属的 Server 实例
-	transport net.Conn
-	ctx       context.Context
-	cancel    context.CancelFunc
-	closeDone chan struct{}
-	IP        string
-	Port      int
-	SendCh    chan []byte
-	Type      string //客户端类型
-	ID        string //客户端ID，全局唯一
-	codec     payloadcodec.Codec
+	Conn         *websocket.Conn
+	Server       *WsServer // 反向引用所属的 Server 实例
+	transport    net.Conn
+	ctx          context.Context
+	cancel       context.CancelFunc
+	closeDone    chan struct{}
+	IP           string
+	Port         int
+	SendCh       chan []byte
+	Type         string //客户端类型
+	ID           string //客户端ID，全局唯一
+	codec        payloadcodec.Codec
+	authID       string
+	authSequence uint64
 
 	pending    map[string]chan *RPCMessage
 	pendingMu  sync.Mutex
@@ -547,6 +558,7 @@ func NewServer(wsPort string) (s *WsServer) {
 		WsPort:        wsPort,
 		clientPool:    make(map[string]map[string]*Client),
 		clientIDMap:   make(map[string]*Client),
+		sessionOrders: make(map[string]*sessionOrder),
 		handlers:      make(map[string]map[string]Handler),
 		connections:   make(map[*Client]struct{}),
 		shutdownDone:  make(chan struct{}),
@@ -701,6 +713,7 @@ func (c *Client) runPumps(readLimit int64, limiter inboundLimiter) {
 	readyDone := make(chan struct{})
 	go func() {
 		defer close(readyDone)
+		defer c.finishSessionRegistration()
 		if s.callClientReady(c) && c.registerReady() {
 			pumps.Go(c.handlerPump)
 			pumps.Go(c.writePump)
@@ -782,8 +795,10 @@ func (c *Client) authenticate(timeout time.Duration) error {
 	}
 	c.Type, c.ID = result.Type, result.ID
 	c.codec = result.Codec
+	c.beginSessionRegistration()
 
 	if err := c.sendAuthResponse(true, ""); err != nil {
+		c.finishSessionRegistration()
 		return fmt.Errorf("send auth response failed: %w", err)
 	}
 	log.Info("客户端认证成功: 类型=%s, ID=%s, IP=%s:%d", c.Type, c.ID, c.IP, c.Port)
@@ -808,6 +823,33 @@ func defaultAuthenticator(ctx context.Context, c *Client, data []byte) (*AuthRes
 	}, nil
 }
 
+// 记录认证结果被接受的顺序，写认证响应和执行就绪回调可以并发进行。
+func (c *Client) beginSessionRegistration() {
+	s := c.Server
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	c.authID = c.ID
+	order := s.sessionOrders[c.authID]
+	if order == nil {
+		order = &sessionOrder{}
+		s.sessionOrders[c.authID] = order
+	}
+	order.lastAuthenticated++
+	order.pending++
+	c.authSequence = order.lastAuthenticated
+}
+
+func (c *Client) finishSessionRegistration() {
+	s := c.Server
+	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	order := s.sessionOrders[c.authID]
+	order.pending--
+	if order.pending == 0 {
+		delete(s.sessionOrders, c.authID)
+	}
+}
+
 func (c *Client) registerReady() bool {
 	s := c.Server
 	s.lifecycleMu.Lock()
@@ -823,6 +865,18 @@ func (c *Client) registerReady() bool {
 		s.lifecycleMu.Unlock()
 		return false
 	}
+	order := s.sessionOrders[c.authID]
+	if c.authSequence < order.lastReady {
+		kick := c.closing.CompareAndSwap(false, true)
+		s.clientsMu.Unlock()
+		s.lifecycleMu.Unlock()
+		if kick {
+			// 过期连接也接收顶号通知，避免它自动重连再顶掉新会话。
+			go c.notifyKickedAndClose()
+		}
+		return false
+	}
+	order.lastReady = c.authSequence
 	oldClient := s.clientIDMap[id]
 	var kickOld bool
 	if oldClient != nil && oldClient != c {

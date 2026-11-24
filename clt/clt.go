@@ -227,6 +227,15 @@ func (c *WSClient) readPump(ctx context.Context, conn *websocket.Conn, handlerCh
 type outboundQueue struct {
 	frames chan []byte
 	calls  sync.Map // 帧首字节的地址 -> context.Context
+	cancel context.CancelFunc
+
+	admissionMu sync.Mutex // 将 Send 入队与本次连接的断开串行化
+}
+
+func (q *outboundQueue) stop() {
+	q.admissionMu.Lock()
+	defer q.admissionMu.Unlock()
+	q.cancel()
 }
 
 // canWrite 检查已出队的 RPC 是否仍可发送。普通帧没有对应的上下文。
@@ -242,6 +251,7 @@ func (c *WSClient) writePump(ctx context.Context, conn *websocket.Conn, queue *o
 	ticker := time.NewTicker(c.heartbeatPeriod())
 	defer func() {
 		ticker.Stop()
+		queue.stop()
 		conn.CloseNow()
 		wg.Done()
 	}()
@@ -316,17 +326,25 @@ func (c *WSClient) Send(method string, arg any) error {
 		return fmt.Errorf("marshal rpc message failed: %w", err)
 	}
 
-	if connCtx.Err() != nil {
-		return c.callDoneError(connCtx, "send request timeout")
-	}
+	queue.admissionMu.Lock()
+	defer queue.admissionMu.Unlock()
 	select {
 	case <-connCtx.Done():
 		return c.callDoneError(connCtx, "send request timeout")
-	case queue.frames <- b:
-		return nil
 	default:
-		return errors.New("send channel is full, message dropped")
 	}
+
+	var enqueueErr error
+	select {
+	case queue.frames <- b:
+	default:
+		enqueueErr = errors.New("send channel is full, message dropped")
+	}
+	// 父上下文也可以直接取消连接，在返回前再次检查。
+	if connCtx.Err() != nil {
+		return c.callDoneError(connCtx, "send request timeout")
+	}
+	return enqueueErr
 }
 
 func (c *WSClient) Call(method string, arg any) (json.RawMessage, error) {
@@ -689,7 +707,7 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 		var connWG sync.WaitGroup
 		connDone := make(chan struct{})
 		handlerCh := make(chan RPCMessage, c.handlerQueueCap())
-		queue := &outboundQueue{frames: make(chan []byte, defaultSendQueue)}
+		queue := &outboundQueue{frames: make(chan []byte, defaultSendQueue), cancel: connCancel}
 		sendCh := queue.frames
 		connWG.Add(3)
 
@@ -723,7 +741,7 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 
 		log.Info("已连接到服务器: %s, IP地址：%s:%d", c.Addr, c.IP, c.Port)
 
-		go c.readPump(connCtx, conn, handlerCh, sendCh, connCancel, &connWG)
+		go c.readPump(connCtx, conn, handlerCh, sendCh, queue.stop, &connWG)
 		go c.writePump(connCtx, conn, queue, &connWG)
 		go c.handlerPump(connCtx, handlerCh, sendCh, &connWG)
 		go func() {
