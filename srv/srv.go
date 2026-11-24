@@ -186,8 +186,8 @@ func (s *WsServer) SetAuthenticator(authenticator Authenticator) {
 	}
 }
 
-// SetOnClientReady 注册认证成功回调，在消息循环启动前同步执行；回调阻塞期间
-// 连接不会处理消息，Shutdown 也会等待它返回。
+// SetOnClientReady 注册认证成功回调。回调完成后才发布连接、替换旧会话和分发业务消息。
+// 回调可调用 CloseWithReason 拒绝新连接。Shutdown 会等待回调返回。
 func (s *WsServer) SetOnClientReady(fn ClientHook) {
 	s.onClientReady = fn
 }
@@ -446,9 +446,6 @@ func (c *Client) readPump(readLimit int64, limiter inboundLimiter) {
 			log.Error("readPump panic recovered: %v, client %s:%d", r, c.IP, c.Port)
 		}
 		c.closeNow()
-		c.removeFromPool()
-		c.Server.connMgr.unregister(c)
-		c.Server.callClientClose(c)
 	}()
 
 	for {
@@ -690,32 +687,52 @@ func (s *WsServer) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.connMgr.register(client)
-	s.callClientReady(client)
-
 	pumpsStarted = true
 	go client.runPumps(s.readLimit, newInboundLimiter(s.messageRate, s.byteRate, s.readLimit))
 }
 
 func (c *Client) runPumps(readLimit int64, limiter inboundLimiter) {
-	defer c.Server.finishConnection(c)
+	s := c.Server
+	defer s.finishConnection(c)
+	s.connMgr.register(c)
+
+	// 就绪回调执行期间仍然读取控制帧和检测断线，业务请求只入队。
 	var pumps sync.WaitGroup
-	pumps.Go(c.handlerPump)
-	pumps.Go(c.writePump)
+	readyDone := make(chan struct{})
+	go func() {
+		defer close(readyDone)
+		if s.callClientReady(c) && c.registerReady() {
+			pumps.Go(c.handlerPump)
+			pumps.Go(c.writePump)
+		} else {
+			c.closeNow()
+		}
+	}()
+
 	c.readPump(readLimit, limiter)
+	<-readyDone
+	<-c.closeDone
+	c.removeFromPool()
+	s.connMgr.unregister(c)
+	s.callClientClose(c)
 	pumps.Wait()
 }
 
-func (s *WsServer) callClientReady(c *Client) {
+func (s *WsServer) callClientReady(c *Client) (ready bool) {
+	if c.closing.Load() {
+		return false
+	}
 	if s.onClientReady == nil {
-		return
+		return true
 	}
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("onClientReady panic recovered: %v", r)
+			c.CloseWithReason(websocket.StatusInternalError, "client setup failed")
 		}
 	}()
 	s.onClientReady(c)
+	return !c.closing.Load()
 }
 
 func (s *WsServer) callClientClose(c *Client) {
@@ -763,14 +780,11 @@ func (c *Client) authenticate(timeout time.Duration) error {
 		c.CloseWithReason(websocket.StatusPolicyViolation, "auth failed: invalid auth result")
 		return err
 	}
+	c.Type, c.ID = result.Type, result.ID
 	c.codec = result.Codec
 
 	if err := c.sendAuthResponse(true, ""); err != nil {
 		return fmt.Errorf("send auth response failed: %w", err)
-	}
-
-	if !c.registerAuthenticated(result.Type, result.ID) {
-		return errors.New("server shutting down")
 	}
 	log.Info("客户端认证成功: 类型=%s, ID=%s, IP=%s:%d", c.Type, c.ID, c.IP, c.Port)
 	return nil
@@ -794,16 +808,21 @@ func defaultAuthenticator(ctx context.Context, c *Client, data []byte) (*AuthRes
 	}, nil
 }
 
-func (c *Client) registerAuthenticated(clientType, id string) bool {
+func (c *Client) registerReady() bool {
 	s := c.Server
 	s.lifecycleMu.Lock()
 	if s.stopping {
 		s.lifecycleMu.Unlock()
 		return false
 	}
-	c.Type, c.ID = clientType, id
+	clientType, id := c.Type, c.ID
 
 	s.clientsMu.Lock()
+	if c.closing.Load() {
+		s.clientsMu.Unlock()
+		s.lifecycleMu.Unlock()
+		return false
+	}
 	oldClient := s.clientIDMap[id]
 	var kickOld bool
 	if oldClient != nil && oldClient != c {

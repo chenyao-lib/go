@@ -120,6 +120,8 @@ type WSClient struct {
 	mu         sync.RWMutex
 	isReady    bool
 	connDone   <-chan struct{}
+	connCtx    context.Context
+	outbound   *outboundQueue
 	codec      payloadcodec.Codec
 
 	pending     map[string]chan *RPCMessage
@@ -221,7 +223,22 @@ func (c *WSClient) readPump(ctx context.Context, conn *websocket.Conn, handlerCh
 	}
 }
 
-func (c *WSClient) writePump(ctx context.Context, conn *websocket.Conn, sendCh <-chan []byte, wg *sync.WaitGroup) {
+// outboundQueue 给内部 Call 附带期限，同时保留公开 SendCh 的字节队列和发送顺序。
+type outboundQueue struct {
+	frames chan []byte
+	calls  sync.Map // 帧首字节的地址 -> context.Context
+}
+
+// canWrite 检查已出队的 RPC 是否仍可发送。普通帧没有对应的上下文。
+func (q *outboundQueue) canWrite(frame []byte) bool {
+	if len(frame) == 0 {
+		return true
+	}
+	ctx, ok := q.calls.LoadAndDelete(&frame[0])
+	return !ok || ctx.(context.Context).Err() == nil
+}
+
+func (c *WSClient) writePump(ctx context.Context, conn *websocket.Conn, queue *outboundQueue, wg *sync.WaitGroup) {
 	ticker := time.NewTicker(c.heartbeatPeriod())
 	defer func() {
 		ticker.Stop()
@@ -235,10 +252,14 @@ func (c *WSClient) writePump(ctx context.Context, conn *websocket.Conn, sendCh <
 			// 退出前优雅关闭协议连接
 			_ = conn.Close(websocket.StatusNormalClosure, "")
 			return
-		case msg, ok := <-sendCh:
+		case msg, ok := <-queue.frames:
 			if !ok {
 				return
 			}
+			if !queue.canWrite(msg) {
+				continue
+			}
+			// 已开始写入的帧使用连接的写期限，避免 RPC 等待超时关闭连接。
 			writeCtx, cancel := context.WithTimeout(ctx, time.Duration(c.writeTimeout.Load()))
 			err := conn.Write(writeCtx, websocket.MessageText, msg)
 			cancel()
@@ -260,13 +281,13 @@ func (c *WSClient) writePump(ctx context.Context, conn *websocket.Conn, sendCh <
 
 // sendQueue 返回当前连接的发送队列。队列随连接更换，断线期间排队的消息和
 // 旧连接处理器迟到的响应不会被下一次连接消费。
-func (c *WSClient) sendQueue() (chan []byte, bool) {
+func (c *WSClient) sendQueue() (*outboundQueue, context.Context) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if !c.isReady || c.Conn == nil || c.SendCh == nil {
-		return nil, false
+	if !c.isReady || c.Conn == nil || c.outbound == nil || c.connCtx == nil {
+		return nil, nil
 	}
-	return c.SendCh, true
+	return c.outbound, c.connCtx
 }
 
 func (c *WSClient) Send(method string, arg any) error {
@@ -274,8 +295,8 @@ func (c *WSClient) Send(method string, arg any) error {
 	if c.closed.Load() {
 		return errors.New("client already closed")
 	}
-	sendCh, ready := c.sendQueue()
-	if !ready {
+	queue, connCtx := c.sendQueue()
+	if queue == nil {
 		return errors.New("connection is not ready, reconnecting")
 	}
 
@@ -295,17 +316,16 @@ func (c *WSClient) Send(method string, arg any) error {
 		return fmt.Errorf("marshal rpc message failed: %w", err)
 	}
 
+	if connCtx.Err() != nil {
+		return c.callDoneError(connCtx, "send request timeout")
+	}
 	select {
-	case sendCh <- b:
+	case <-connCtx.Done():
+		return c.callDoneError(connCtx, "send request timeout")
+	case queue.frames <- b:
 		return nil
 	default:
-		// 通道满，再检查是否因为 ctx 取消导致
-		select {
-		case <-c.Ctx.Done():
-			return errors.New("client is closing")
-		default:
-			return errors.New("send channel is full, message dropped")
-		}
+		return errors.New("send channel is full, message dropped")
 	}
 }
 
@@ -314,12 +334,12 @@ func (c *WSClient) Call(method string, arg any) (json.RawMessage, error) {
 	if c.closed.Load() {
 		return nil, errors.New("client already closed")
 	}
-	sendCh, ready := c.sendQueue()
-	if !ready {
+	queue, connCtx := c.sendQueue()
+	if queue == nil {
 		return nil, errors.New("connection is not ready, reconnecting")
 	}
 
-	ctx, cancel := c.callContext(method)
+	ctx, cancel := c.callContext(connCtx, method)
 	defer cancel()
 
 	// 序列化参数
@@ -330,20 +350,6 @@ func (c *WSClient) Call(method string, arg any) (json.RawMessage, error) {
 	}
 
 	session := c.nextSession()
-	rspChan := make(chan *RPCMessage, 1)
-
-	// 注册等待队列
-	c.pendingMu.Lock()
-	c.pending[session] = rspChan
-	c.pendingMu.Unlock()
-
-	// 确保退出时清理
-	defer func() {
-		c.pendingMu.Lock()
-		delete(c.pending, session)
-		c.pendingMu.Unlock()
-	}()
-
 	// 发送请求
 	req := RPCMessage{
 		Session: session,
@@ -356,9 +362,26 @@ func (c *WSClient) Call(method string, arg any) (json.RawMessage, error) {
 		return nil, err
 	}
 
+	rspChan := make(chan *RPCMessage, 1)
+	c.pendingMu.Lock()
+	if ctx.Err() != nil {
+		c.pendingMu.Unlock()
+		return nil, c.callDoneError(ctx, "send request timeout")
+	}
+	c.pending[session] = rspChan
+	c.pendingMu.Unlock()
+	defer func() {
+		c.pendingMu.Lock()
+		delete(c.pending, session)
+		c.pendingMu.Unlock()
+	}()
+
+	// 超时后保留已入队帧的期限，直到写协程取出并跳过它。
+	queue.calls.Store(&b[0], ctx)
 	select {
-	case sendCh <- b:
+	case queue.frames <- b:
 	case <-ctx.Done():
+		queue.calls.Delete(&b[0])
 		return nil, c.callDoneError(ctx, "send request timeout")
 	}
 
@@ -370,17 +393,19 @@ func (c *WSClient) Call(method string, arg any) (json.RawMessage, error) {
 		}
 		return rsp.Data, nil
 	case <-ctx.Done():
-		log.Error("rpc call timeout, data: %s", string(b))
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			log.Error("rpc call timeout, method: %s, session: %s", method, session)
+		}
 		return nil, c.callDoneError(ctx, "rpc timeout")
 	}
 }
 
-func (c *WSClient) callContext(method string) (context.Context, context.CancelFunc) {
+func (c *WSClient) callContext(connCtx context.Context, method string) (context.Context, context.CancelFunc) {
 	timeout := c.callTimeout(method)
 	if timeout <= 0 {
-		return context.WithCancel(c.Ctx)
+		return context.WithCancel(connCtx)
 	}
-	return context.WithTimeout(c.Ctx, timeout)
+	return context.WithTimeout(connCtx, timeout)
 }
 
 func (c *WSClient) callTimeout(method string) time.Duration {
@@ -394,8 +419,11 @@ func (c *WSClient) callTimeout(method string) time.Duration {
 }
 
 func (c *WSClient) callDoneError(ctx context.Context, timeoutMsg string) error {
-	if errors.Is(c.Ctx.Err(), context.Canceled) {
+	if c.Ctx.Err() != nil {
 		return errors.New("client is closing")
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return errors.New("connection lost, please retry")
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return errors.New(timeoutMsg)
@@ -661,14 +689,17 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 		var connWG sync.WaitGroup
 		connDone := make(chan struct{})
 		handlerCh := make(chan RPCMessage, c.handlerQueueCap())
-		sendCh := make(chan []byte, defaultSendQueue)
+		queue := &outboundQueue{frames: make(chan []byte, defaultSendQueue)}
+		sendCh := queue.frames
 		connWG.Add(3)
 
 		c.mu.Lock()
 		c.Conn = conn
 		c.connDone = connDone
+		c.connCtx = connCtx
 		c.HandlerCh = handlerCh
 		c.SendCh = sendCh
+		c.outbound = queue
 		u, parseErr := url.Parse(c.Addr)
 		if parseErr == nil {
 			host, port, splitErr := net.SplitHostPort(u.Host)
@@ -693,7 +724,7 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 		log.Info("已连接到服务器: %s, IP地址：%s:%d", c.Addr, c.IP, c.Port)
 
 		go c.readPump(connCtx, conn, handlerCh, sendCh, connCancel, &connWG)
-		go c.writePump(connCtx, conn, sendCh, &connWG)
+		go c.writePump(connCtx, conn, queue, &connWG)
 		go c.handlerPump(connCtx, handlerCh, sendCh, &connWG)
 		go func() {
 			connWG.Wait()
@@ -714,6 +745,8 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 		if c.Conn == conn {
 			c.Conn = nil
 			c.connDone = nil
+			c.connCtx = nil
+			c.outbound = nil
 		}
 		c.isReady = false
 		c.mu.Unlock()

@@ -142,13 +142,12 @@ type ServiceMsg struct {
 
 type handlerCtxKey struct{}
 
-// handlerExecState 记录 handler 上下文的属主与执行令牌状态。
-// released 防止同一上下文的并发 Call/Sleep 重复释放令牌；
-// done 在 handler 返回后置位，阻止派生 goroutine 继续借用该上下文。
+// handlerExecState 按一次 handler 执行跟踪令牌的归还与临时让出。
 type handlerExecState struct {
 	owner    *Service
-	released atomic.Bool
-	done     atomic.Bool
+	mu       sync.Mutex
+	released bool
+	done     chan struct{}
 }
 
 func handlerStateFromContext(ctx context.Context) *handlerExecState {
@@ -218,6 +217,7 @@ type Service struct {
 	// 再次 Start 会重新 close(quit)，panic: close of closed channel。
 	lifecycleMu sync.Mutex
 	stopped     bool
+	admissionMu sync.Mutex // 将消息入队与停止接收新消息串行化
 
 	// timeoutsMu 保护 methodTimeouts / callTimeouts：旧实现运行期调用
 	// SetMethodTimeout 会与 handler 协程的读并发触发 concurrent map write。
@@ -447,10 +447,8 @@ func (s *Service) Start() error {
 
 func (s *Service) runInit() error {
 	<-s.execToken
-	defer func() { s.execToken <- struct{}{} }()
-
-	state := &handlerExecState{owner: s}
-	defer state.done.Store(true)
+	state := &handlerExecState{owner: s, done: make(chan struct{})}
+	defer s.finishHandler(state)
 	ctx := context.WithValue(context.Background(), handlerCtxKey{}, state)
 
 	s.Info("initializing...")
@@ -473,7 +471,10 @@ func (s *Service) Stop() {
 		return
 	}
 
-	if !s.state.CompareAndSwap(int32(StateRunning), int32(StateStopping)) {
+	s.admissionMu.Lock()
+	stopping := s.state.CompareAndSwap(int32(StateRunning), int32(StateStopping))
+	s.admissionMu.Unlock()
+	if !stopping {
 		// 未启动或已处于停止流程，不关闭任何 channel。
 		s.lifecycleMu.Unlock()
 		return
@@ -549,14 +550,15 @@ func (s *Service) deliverResponse(msg *ServiceMsg) {
 
 func (s *Service) startHandler(msg *ServiceMsg) {
 	s.wg.Add(1)
-	go func(m *ServiceMsg) {
+	go func() {
 		defer s.wg.Done()
-		defer func() { s.execToken <- struct{}{} }()
-		s.handleOne(m)
-	}(msg)
+		state := &handlerExecState{owner: s, done: make(chan struct{})}
+		defer s.finishHandler(state)
+		s.handleOne(msg, state)
+	}()
 }
 
-func (s *Service) handleOne(msg *ServiceMsg) {
+func (s *Service) handleOne(msg *ServiceMsg, state *handlerExecState) {
 	if msg.ctx != nil && msg.ctx.Err() != nil {
 		return
 	}
@@ -583,8 +585,6 @@ func (s *Service) handleOne(msg *ServiceMsg) {
 		timeout := s.handlerTimeout(msg.Method)
 		ctx, cancel := s.handlerContext(msg.ctx, timeout)
 		defer cancel()
-		state := &handlerExecState{owner: s}
-		defer state.done.Store(true)
 		ctx = context.WithValue(ctx, handlerCtxKey{}, state)
 
 		res, err := handler(ctx, msg.Data)
@@ -689,6 +689,21 @@ func (s *Service) drainRemaining(pending *ServiceMsg) {
 	}
 }
 
+// tryEnqueue 只在 Stop 开始排空前接受消息，且在持锁期间不等待队列空间。
+func (s *Service) tryEnqueue(msg *ServiceMsg) error {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if s.state.Load() != int32(StateRunning) {
+		return ErrServiceNotRunning
+	}
+	select {
+	case s.msgCh <- msg:
+		return nil
+	default:
+		return ErrQueueFull
+	}
+}
+
 // ==================== 同步 RPC ====================
 
 func (s *Service) RawCall(ctx context.Context, method string, args any) (any, error) {
@@ -737,27 +752,46 @@ func (s *Service) claimHandlerToken(state *handlerExecState) error {
 		}
 		return fmt.Errorf("%w: ctx owner is %q", ErrTokenNotOwned, owner)
 	}
-	if state.done.Load() {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	select {
+	case <-state.done:
 		return ErrHandlerFinished
+	default:
 	}
-	if !state.released.CompareAndSwap(false, true) {
+	if state.released {
 		return ErrTokenAlreadyReleased
 	}
-	s.releaseExecToken()
+	state.released = true
+	s.execToken <- struct{}{}
 	return nil
 }
 
 func (s *Service) releaseHandlerToken(state *handlerExecState) {
-	s.acquireExecToken()
-	state.released.Store(false)
+	select {
+	case <-state.done:
+		return
+	case <-s.execToken:
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	select {
+	case <-state.done:
+		// Handler 在重新拿到令牌期间退出，令牌归还给服务队列。
+		s.execToken <- struct{}{}
+	default:
+		state.released = false
+	}
 }
 
-func (s *Service) releaseExecToken() {
-	s.execToken <- struct{}{}
-}
-
-func (s *Service) acquireExecToken() {
-	<-s.execToken
+func (s *Service) finishHandler(state *handlerExecState) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	close(state.done)
+	if !state.released {
+		s.execToken <- struct{}{}
+	}
 }
 
 func (s *Service) rawCall(parent context.Context, method string, args any) (any, error) {
@@ -779,18 +813,18 @@ func (s *Service) rawCall(parent context.Context, method string, args any) (any,
 		rspCh: rspCh,
 	}
 
-	select {
-	case s.msgCh <- msg:
-	case <-s.quit:
-		s.metrics.TotalCallTimeouts.Add(1)
-		return nil, ErrServiceStopping
-	case <-ctx.Done():
+	if ctx.Err() != nil {
 		s.metrics.TotalCallTimeouts.Add(1)
 		return nil, ErrCallTimeout
-	default:
+	}
+	switch err := s.tryEnqueue(msg); err {
+	case ErrServiceNotRunning:
+		s.metrics.TotalCallTimeouts.Add(1)
+		return nil, ErrServiceStopping
+	case ErrQueueFull:
 		s.metrics.TotalSendFailures.Add(1)
 		s.metrics.SendNBFullTotal.Add(1)
-		return nil, ErrQueueFull
+		return nil, err
 	}
 
 	s.metrics.TotalCalls.Add(1)
@@ -823,6 +857,9 @@ func (s *Service) Sleep(ctx context.Context, d time.Duration) {
 	if d <= 0 {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	if state := handlerStateFromContext(ctx); state != nil {
 		if err := s.claimHandlerToken(state); err != nil {
@@ -834,6 +871,7 @@ func (s *Service) Sleep(ctx context.Context, d time.Duration) {
 
 	select {
 	case <-time.After(d):
+	case <-ctx.Done():
 	case <-s.quit:
 	}
 }
@@ -859,14 +897,12 @@ func (s *Service) RawSend(ctx context.Context, method string, args any) error {
 		ctx:    ctx,
 	}
 
-	select {
-	case s.msgCh <- msg:
-		return nil
-	default:
+	err := s.tryEnqueue(msg)
+	if err == ErrQueueFull {
 		s.metrics.TotalSendFailures.Add(1)
 		s.metrics.SendNBFullTotal.Add(1)
-		return ErrQueueFull
 	}
+	return err
 }
 
 func (s *Service) Send(targetService, method string, args any) error {
@@ -879,23 +915,20 @@ func (s *Service) Send(targetService, method string, args any) error {
 		return fmt.Errorf("%w: %s", ErrServiceNotFound, targetService)
 	}
 
-	if target.state.Load() != int32(StateRunning) {
-		return fmt.Errorf("%w: %s (state=%d)", ErrServiceNotRunning, targetService, target.state.Load())
-	}
-
 	msg := &ServiceMsg{
 		Method: method,
 		Data:   args,
 	}
 
-	select {
-	case target.msgCh <- msg:
-		return nil
-	default:
+	err := target.tryEnqueue(msg)
+	switch err {
+	case ErrServiceNotRunning:
+		return fmt.Errorf("%w: %s (state=%d)", err, targetService, target.state.Load())
+	case ErrQueueFull:
 		s.metrics.TotalSendFailures.Add(1)
 		target.metrics.SendNBFullTotal.Add(1)
-		return ErrQueueFull
 	}
+	return err
 }
 
 // ==================== 内部工具 ====================
