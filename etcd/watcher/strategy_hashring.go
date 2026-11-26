@@ -8,6 +8,8 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
+const defaultVirtualNodes = 150
+
 // ConsistentHash 一致性哈希环
 // 实现了 SelectStrategy 接口
 type ConsistentHash struct {
@@ -18,8 +20,11 @@ type ConsistentHash struct {
 }
 
 // NewConsistentHash 创建一致性哈希环
-// virtualNum 为每个真实节点对应的虚拟节点数量
+// virtualNum 为每个真实节点对应的虚拟节点数量，非正数使用默认值 150。
 func NewConsistentHash(virtualNum int) *ConsistentHash {
+	if virtualNum <= 0 {
+		virtualNum = defaultVirtualNodes
+	}
 	return &ConsistentHash{
 		nodeMap:    make(map[uint64]string),
 		virtualNum: virtualNum,

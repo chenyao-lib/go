@@ -17,12 +17,15 @@
 //
 //	_ = server.Start()
 //
-// 工厂应为每个连接返回新的 Service 实例，并确保 Name 在进程内唯一，例如包含
-// client.ID。连接 ready 后 binding 按顺序执行中间件、创建并启动 Service；
-// 连接关闭时先停止 Service，再按逆序执行已成功 ready 的中间件。
+// 工厂应为每个连接返回新的 Service 实例。不同客户端的服务名应在进程内唯一，
+// 例如包含 client.ID。同 ID 的 *svc.Service 可以复用名称，服务初始化成功
+// 且连接就绪时才会发布新实例。与其它服务同名时会在 Service.Init 前拒绝。
+// 连接关闭时先停止 Service，再按逆序执行已成功
+// ready 的中间件。
 //
 // NewClientServiceBinding 会接管 WsServer 的 OnClientReady、OnClientClose 和
-// DefaultHandler。创建 binding 后不要再调用对应 setter 覆盖它们；需要额外
+// DefaultHandler，并清除之前设置的 OnClientReadyCommit。
+// 创建 binding 后不要再调用对应 setter 覆盖这些回调；需要额外
 // 生命周期逻辑时应使用 Middleware。
 //
 // # 消息分发
@@ -48,6 +51,7 @@ package srvsvcbinding
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/chenyao-lib/go/srv"
@@ -58,9 +62,10 @@ import (
 
 // Middleware 在不侵入具体业务 Service 的情况下扩展连接生命周期。
 //
-// OnClientReady 在业务 Service 启动前按注册顺序执行；某个中间件返回错误时，
+// OnClientReady 使用连接上下文，在业务 Service 启动前按注册顺序执行；某个中间件返回错误时，
 // binding 只回滚此前已经 ready 成功的中间件，并拒绝当前连接。
-// OnClientClose 在业务 Service 停止后按注册顺序的逆序执行。
+// 连接关闭时先等待 BeforeMessage 退出并停止业务 Service，再逆序执行 OnClientClose。
+// BeforeMessage 应在连接上下文取消时退出。
 // BeforeMessage 在每条 RPC 分发前执行，任一中间件返回错误都会终止本次分发，
 // 但 binding 不会自动关闭连接；是否关闭应由对应中间件根据错误语义决定。
 type Middleware interface {
@@ -121,6 +126,10 @@ type connectionState struct {
 	mu               sync.RWMutex
 	service          svc.Instance
 	readyMiddlewares []Middleware
+	closing          bool
+	guards           sync.WaitGroup
+
+	releaseName func() // set during readiness, releases this service's share of the reservation
 }
 
 // addReadyMiddleware 记录一个已成功 ready 的中间件。
@@ -144,29 +153,57 @@ func (s *connectionState) snapshot() (svc.Instance, []Middleware) {
 	return s.service, append([]Middleware(nil), s.readyMiddlewares...)
 }
 
+func (s *connectionState) beginGuards() (svc.Instance, []Middleware) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closing || s.service == nil {
+		return nil, nil
+	}
+	s.guards.Add(1)
+	return s.service, append([]Middleware(nil), s.readyMiddlewares...)
+}
+
+func (s *connectionState) stopGuards() {
+	s.mu.Lock()
+	s.closing = true
+	s.mu.Unlock()
+	s.guards.Wait()
+}
+
 // ClientServiceBinding 将每个 WebSocket 客户端绑定到独立的业务 Service，
 // 并在 Service 外层统一执行连接生命周期和消息守卫中间件。
 type ClientServiceBinding struct {
 	states      sync.Map
 	svcFactory  func(c *srv.Client) svc.Instance
 	middlewares []Middleware
+	namesMu     sync.Mutex
+	names       map[string]*boundServiceName
+}
+
+type boundServiceName struct {
+	name        string
+	clientID    string
+	reservation *svc.NameReservation
+	connections int
 }
 
 // NewClientServiceBinding 创建 binding，并独占设置 WsServer 的 ready、close
-// 和 default message handler。调用方不应再覆盖这三个 hook；额外逻辑应通过
+// 和 default message handler，同时清除原有 ready commit hook。
+// 调用方不应再覆盖这些 hook；额外逻辑应通过
 // WithMiddleware 注册，避免会话清理或业务 Service 生命周期被绕过。
 func NewClientServiceBinding(
 	ws *srv.WsServer,
 	svcFactory func(c *srv.Client) svc.Instance,
 	opts ...Option,
 ) *ClientServiceBinding {
-	b := &ClientServiceBinding{svcFactory: svcFactory}
+	b := &ClientServiceBinding{svcFactory: svcFactory, names: make(map[string]*boundServiceName)}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(b)
 		}
 	}
 	ws.SetOnClientReady(b.onClientReady)
+	ws.SetOnClientReadyCommit(nil)
 	ws.SetOnClientClose(b.onClientClose)
 	ws.RegisterDefaultHandler(b.handleMessage)
 	log.Info("连接服务绑定已创建: middlewares=%d", len(b.middlewares))
@@ -178,9 +215,17 @@ func NewClientServiceBinding(
 func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 	state := &connectionState{}
 	b.states.Store(c, state)
-	ctx := context.Background()
+	ctx := c.Context()
+	rollback := func() {
+		b.states.Delete(c)
+		b.stopConnection(context.WithoutCancel(ctx), state, c)
+	}
 
 	for _, middleware := range b.middlewares {
+		if ctx.Err() != nil {
+			rollback()
+			return
+		}
 		if err := middleware.OnClientReady(ctx, c); err != nil {
 			log.Error(
 				"连接中间件初始化失败: client_type=%s, client_id=%s, err=%v",
@@ -188,14 +233,17 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 				c.ID,
 				err,
 			)
-			b.states.Delete(c)
-			b.stopConnection(ctx, state, c)
+			rollback()
 			c.CloseWithReason(1011, "prepare connection failed")
 			return
 		}
 		state.addReadyMiddleware(middleware)
 	}
 
+	if ctx.Err() != nil {
+		rollback()
+		return
+	}
 	connSvc := b.svcFactory(c)
 	if connSvc == nil {
 		log.Error(
@@ -203,21 +251,38 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 			c.Type,
 			c.ID,
 		)
-		b.states.Delete(c)
-		b.stopConnection(ctx, state, c)
+		rollback()
 		c.CloseWithReason(1011, "create connection service failed")
 		return
 	}
-	if err := connSvc.Start(); err != nil {
+	var startErr error
+	switch starter := connSvc.(type) {
+	case *svc.Service:
+		var bound *boundServiceName
+		bound, startErr = b.reserveServiceName(c.ID, starter.Name())
+		if startErr == nil {
+			state.releaseName = sync.OnceFunc(func() { b.releaseServiceName(bound) })
+			startErr = bound.reservation.PrepareContext(ctx, starter, state.releaseName)
+			if startErr == nil {
+				c.SetReadyHandoff(func(publish func()) error {
+					return bound.reservation.PublishWithCommit(starter, publish)
+				})
+			}
+		}
+	case interface{ StartContext(context.Context) error }:
+		startErr = starter.StartContext(ctx)
+	default:
+		startErr = connSvc.Start()
+	}
+	if startErr != nil {
 		log.Error(
 			"连接服务启动失败: client_type=%s, client_id=%s, service=%s, err=%v",
 			c.Type,
 			c.ID,
 			connSvc.Name(),
-			err,
+			startErr,
 		)
-		b.states.Delete(c)
-		b.stopConnection(ctx, state, c)
+		rollback()
 		c.CloseWithReason(1011, "start connection service failed")
 		return
 	}
@@ -228,6 +293,35 @@ func (b *ClientServiceBinding) onClientReady(c *srv.Client) {
 		c.ID,
 		connSvc.Name(),
 	)
+}
+
+func (b *ClientServiceBinding) reserveServiceName(clientID, name string) (*boundServiceName, error) {
+	b.namesMu.Lock()
+	defer b.namesMu.Unlock()
+	bound := b.names[name]
+	if bound == nil {
+		reservation, err := svc.ReserveName(name)
+		if err != nil {
+			return nil, err
+		}
+		bound = &boundServiceName{name: name, clientID: clientID, reservation: reservation}
+		b.names[name] = bound
+	}
+	if bound.clientID != clientID {
+		return nil, fmt.Errorf("service %q belongs to another client", name)
+	}
+	bound.connections++
+	return bound, nil
+}
+
+func (b *ClientServiceBinding) releaseServiceName(bound *boundServiceName) {
+	b.namesMu.Lock()
+	defer b.namesMu.Unlock()
+	bound.connections--
+	if bound.connections == 0 {
+		delete(b.names, bound.name)
+		bound.reservation.Release()
+	}
 }
 
 // onClientClose 保证连接状态只取出一次，避免重复 close 导致重复清理。
@@ -255,7 +349,7 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 		return nil, err
 	}
 	state := value.(*connectionState)
-	connSvc, readyMiddlewares := state.snapshot()
+	connSvc, readyMiddlewares := state.beginGuards()
 	if connSvc == nil {
 		err := errors.New("connection service is not ready")
 		log.Warn(
@@ -269,7 +363,21 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 	}
 
 	ctx := c.Context()
+	if err := checkMessageGuards(ctx, state, c, msg, readyMiddlewares); err != nil {
+		return nil, err
+	}
+	if msg.Session != "" {
+		return connSvc.RawCall(ctx, msg.Method, msg.Data)
+	}
+	return nil, connSvc.RawSend(ctx, msg.Method, msg.Data)
+}
+
+func checkMessageGuards(ctx context.Context, state *connectionState, c *srv.Client, msg srv.RPCMessage, readyMiddlewares []Middleware) error {
+	defer state.guards.Done()
 	for _, middleware := range readyMiddlewares {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := middleware.BeforeMessage(ctx, c, msg); err != nil {
 			log.Warn(
 				"消息被中间件拒绝: client_type=%s, client_id=%s, method=%s, session=%s, err=%v",
@@ -279,30 +387,40 @@ func (b *ClientServiceBinding) handleMessage(c *srv.Client, msg srv.RPCMessage) 
 				msg.Session,
 				err,
 			)
-			return nil, err
+			return err
 		}
 	}
 
-	if msg.Session != "" {
-		return connSvc.RawCall(ctx, msg.Method, msg.Data)
-	}
-	return nil, connSvc.RawSend(ctx, msg.Method, msg.Data)
+	return ctx.Err()
 }
 
-// stopConnection 先停止业务 Service，再逆序清理已经 ready 的中间件。
+// stopConnection 等待消息守卫退出并停止业务 Service，再逆序清理中间件。
 // 逆序与初始化顺序对称，既用于正常断线，也用于 ready/start 失败时回滚。
 func (b *ClientServiceBinding) stopConnection(ctx context.Context, state *connectionState, c *srv.Client) {
+	state.stopGuards()
 	connSvc, readyMiddlewares := state.snapshot()
 	if connSvc != nil {
-		connSvc.Stop()
-		log.Info(
-			"连接服务已停止: client_type=%s, client_id=%s, service=%s",
-			c.Type,
-			c.ID,
-			connSvc.Name(),
-		)
+		runCleanup(c, "service.Stop", func() {
+			connSvc.Stop()
+			log.Info("连接服务已停止: client_type=%s, client_id=%s, service=%s", c.Type, c.ID, connSvc.Name())
+		})
+	}
+	if state.releaseName != nil {
+		state.releaseName()
 	}
 	for idx := len(readyMiddlewares) - 1; idx >= 0; idx-- {
-		readyMiddlewares[idx].OnClientClose(ctx, c)
+		middleware := readyMiddlewares[idx]
+		runCleanup(c, fmt.Sprintf("middleware[%d] %T", idx, middleware), func() {
+			middleware.OnClientClose(ctx, c)
+		})
 	}
+}
+
+func runCleanup(c *srv.Client, phase string, cleanup func()) {
+	defer func() {
+		if value := recover(); value != nil {
+			log.Error("连接清理 panic: client_type=%s, client_id=%s, phase=%s, panic=%v", c.Type, c.ID, phase, value)
+		}
+	}()
+	cleanup()
 }

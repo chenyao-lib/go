@@ -72,7 +72,10 @@ func Base64Decode(s string) ([]byte, error) {
 
 // MustBase64Decode 解码失败时返回 nil(不 panic)
 func MustBase64Decode(s string) []byte {
-	data, _ := base64.StdEncoding.DecodeString(s)
+	data, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil
+	}
 	return data
 }
 

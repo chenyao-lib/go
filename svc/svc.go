@@ -74,6 +74,7 @@ import (
 	"time"
 
 	"github.com/chenyao-lib/go/log"
+	"github.com/outrigdev/goid"
 )
 
 // ==================== 预定义错误 ====================
@@ -101,6 +102,7 @@ const (
 	StateStopped  ServiceState = 0
 	StateRunning  ServiceState = 1
 	StateStopping ServiceState = 2
+	StateStarting ServiceState = 3 // Init has not completed yet.
 )
 
 // ==================== 可配置选项 ====================
@@ -134,20 +136,28 @@ type ServiceMsg struct {
 	Error   error  `json:"-"`
 	IsRsp   bool   `json:"-"`
 
-	ctx   context.Context
-	rspCh chan *ServiceMsg `json:"-"`
+	ctx      context.Context
+	rspCh    chan *ServiceMsg `json:"-"`
+	initCall bool
 }
 
 // ==================== context 标记 ====================
 
 type handlerCtxKey struct{}
+type initScopeKey struct{}
+
+type initScope struct {
+	service *Service
+	done    <-chan struct{}
+}
 
 // handlerExecState 按一次 handler 执行跟踪令牌的归还与临时让出。
 type handlerExecState struct {
-	owner    *Service
-	mu       sync.Mutex
-	released bool
-	done     chan struct{}
+	owner        *Service
+	initializing bool
+	mu           sync.Mutex
+	released     bool
+	done         chan struct{}
 }
 
 func handlerStateFromContext(ctx context.Context) *handlerExecState {
@@ -195,7 +205,15 @@ type ServiceCallTimeoutProvider interface {
 // ==================== 全局注册表（包内单例） ====================
 
 var globalReg = &registry{
-	services: make(map[string]*Service),
+	services:     make(map[string]*Service),
+	reservations: make(map[string]*NameReservation),
+}
+
+var initLookups sync.Map // goroutine ID -> *initLookup
+
+type initLookup struct {
+	service  *Service
+	previous *initLookup
 }
 
 // ==================== 服务主体 ====================
@@ -212,18 +230,22 @@ type Service struct {
 	quit  chan struct{}
 	wg    sync.WaitGroup
 
-	// lifecycleMu 串行化 Start/Stop，保证 quit/monitorQuit 只关闭一次。
-	// stopped 一旦置 true 就禁止再次 Start：旧实现 Stop 后状态回到 Stopped，
-	// 再次 Start 会重新 close(quit)，panic: close of closed channel。
-	lifecycleMu sync.Mutex
-	stopped     bool
-	admissionMu sync.Mutex // 将消息入队与停止接收新消息串行化
+	// These goroutines contribute to wg and cannot wait for their own shutdown.
+	executions sync.Map // goroutine IDs of this service's active handlers and Init
 
-	// timeoutsMu 保护 methodTimeouts / callTimeouts：旧实现运行期调用
-	// SetMethodTimeout 会与 handler 协程的读并发触发 concurrent map write。
+	// lifecycleMu 串行化 Start/Stop，保证 quit/monitorQuit 只关闭一次。
+	// stopDone 非 nil 表示已开始停止，同时禁止再次 Start。
+	lifecycleMu sync.Mutex
+	stopDone    chan struct{}
+	initCancel  context.CancelFunc // lifecycleMu 保护
+	releaseName func()             // lifecycleMu 保护
+	admissionMu sync.Mutex         // 将消息入队与停止接收新消息串行化
+
+	// timeoutsMu 保护默认超时和方法级超时。
 	timeoutsMu sync.RWMutex
 
 	state       atomic.Int32
+	initialized atomic.Bool
 	sessionSeed atomic.Int64
 
 	execToken chan struct{}
@@ -302,16 +324,32 @@ func (s *Service) Debug(format string, args ...any) {
 	log.Write(log.LevelDebug, "DEBUG", false, "%s| %s", s.name, fmt.Sprintf(format, args...))
 }
 
+// SetConfig sets the startup configuration. Calls after startup begins are ignored.
+// Use the timeout setters to adjust timeouts while a service is running.
 func (s *Service) SetConfig(cfg ServiceConfig) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.stopDone != nil || s.State() != StateStopped {
+		s.Warn("SetConfig ignored after startup began")
+		return
+	}
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	s.timeoutsMu.Lock()
+	defer s.timeoutsMu.Unlock()
 	s.config = cfg
 	s.msgCh = make(chan *ServiceMsg, s.config.QueueSize)
 }
 
 func (s *Service) SetHandlerTimeout(timeout time.Duration) {
+	s.timeoutsMu.Lock()
+	defer s.timeoutsMu.Unlock()
 	s.config.HandlerTimeout = timeout
 }
 
 func (s *Service) SetDefaultCallTimeout(timeout time.Duration) {
+	s.timeoutsMu.Lock()
+	defer s.timeoutsMu.Unlock()
 	s.config.CallTimeout = timeout
 }
 
@@ -362,24 +400,92 @@ func (s *Service) SetCallTimeouts(timeouts map[string]time.Duration) {
 // ==================== 全局注册表 ====================
 
 type registry struct {
-	mu       sync.RWMutex
-	services map[string]*Service
+	mu           sync.RWMutex
+	services     map[string]*Service
+	reservations map[string]*NameReservation
 }
 
-func (r *registry) register(name string, svc *Service) error {
+// NameReservation lets one owner prepare multiple services with a shared name
+// while published lookups continue to see the current service.
+type NameReservation struct{ name string }
+
+// ReserveName claims an unused service name until the reservation is released.
+func ReserveName(name string) (*NameReservation, error) {
+	globalReg.mu.Lock()
+	defer globalReg.mu.Unlock()
+	if globalReg.services[name] != nil || globalReg.reservations[name] != nil {
+		return nil, fmt.Errorf("service %q already registered or reserved", name)
+	}
+	reservation := &NameReservation{name: name}
+	globalReg.reservations[name] = reservation
+	return reservation, nil
+}
+
+// PrepareContext initializes a service for the reserved name without publishing
+// it. Once startup begins, release is called when the service stops. If startup
+// is rejected before it begins, the caller still owns the reservation.
+// release should return promptly and may use Release, but must not call Stop.
+func (n *NameReservation) PrepareContext(ctx context.Context, service *Service, release func()) error {
+	if service.name != n.name {
+		return fmt.Errorf("service %q does not match reserved name %q", service.name, n.name)
+	}
+	globalReg.mu.RLock()
+	active := globalReg.reservations[n.name] == n
+	globalReg.mu.RUnlock()
+	if !active {
+		return fmt.Errorf("service name %q has a different reservation", n.name)
+	}
+	return service.startContext(ctx, false, release)
+}
+
+// Publish makes a running service with the reserved name visible by name.
+// It replaces any service previously published by this reservation.
+func (n *NameReservation) Publish(service *Service) error {
+	return n.PublishWithCommit(service, nil)
+}
+
+// PublishWithCommit publishes the service and performs commit within the same
+// lifecycle and registry locks. commit must return promptly and not call svc.
+func (n *NameReservation) PublishWithCommit(service *Service, commit func()) error {
+	if service.name != n.name {
+		return fmt.Errorf("service %q does not match reserved name %q", service.name, n.name)
+	}
+	return service.publishReplacement(nil, n, commit)
+}
+
+// Release lets other services claim the name after the owner has stopped its services.
+func (n *NameReservation) Release() {
+	globalReg.mu.Lock()
+	defer globalReg.mu.Unlock()
+	if globalReg.reservations[n.name] == n {
+		delete(globalReg.reservations, n.name)
+	}
+}
+
+func (r *registry) register(name string, service, previous *Service, reservation *NameReservation, commit func()) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.services[name]; exists {
-		return fmt.Errorf("service %q already registered", name)
+	if r.reservations[name] != reservation {
+		return fmt.Errorf("service name %q has a different reservation", name)
 	}
-	r.services[name] = svc
+	if reservation == nil {
+		if current := r.services[name]; current != nil && current != previous && current != service {
+			return fmt.Errorf("service %q already registered", name)
+		}
+	}
+	if commit != nil {
+		commit()
+	}
+	r.services[name] = service
 	return nil
 }
 
-func (r *registry) unregister(name string) {
+func (r *registry) unregister(name string, service *Service) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.services, name)
+	if r.services[name] == service {
+		delete(r.services, name)
+	}
 }
 
 func (r *registry) get(name string) (*Service, bool) {
@@ -389,67 +495,174 @@ func (r *registry) get(name string) (*Service, bool) {
 	return svc, ok
 }
 
-// GetService 从全局注册表获取服务
+// GetService 从全局注册表获取服务。Init 和它同步调用的初始化 handler
+// 查找自身名称时，返回正在初始化的实例。
 func GetService(name string) (*Service, bool) {
+	if current, ok := initLookups.Load(goid.Get()); ok {
+		for scope := current.(*initLookup); scope != nil; scope = scope.previous {
+			if scope.service.name == name {
+				return scope.service, true
+			}
+		}
+	}
 	return globalReg.get(name)
+}
+
+// GetServiceContext lets goroutines started during Init find the service itself
+// while the initialization context remains active, even after Init returns.
+// Other lookups follow GetService.
+func GetServiceContext(ctx context.Context, name string) (*Service, bool) {
+	if ctx != nil && ctx.Err() == nil {
+		if scope, ok := ctx.Value(initScopeKey{}).(initScope); ok && scope.service.name == name {
+			select {
+			case <-scope.done:
+			default:
+				return scope.service, true
+			}
+		}
+	}
+	return GetService(name)
+}
+
+func (s *Service) enterInitLookup(id uint64) func() {
+	current, _ := initLookups.Load(id)
+	previous, _ := current.(*initLookup)
+	initLookups.Store(id, &initLookup{service: s, previous: previous})
+	return func() {
+		if previous == nil {
+			initLookups.Delete(id)
+		} else {
+			initLookups.Store(id, previous)
+		}
+	}
 }
 
 // ==================== 生命周期 ====================
 
 func (s *Service) Start() error {
+	return s.StartContext(context.Background())
+}
+
+// StartContext 启动服务，并将 ctx 传给 Init。Stop 会取消初始化上下文。
+// Init 应在上下文取消时退出；ctx 取消不会停止已经启动成功的服务。
+// Init 成功后才接收外部消息。Init 可以用传入的 ctx 同步调用自身的 handler。
+func (s *Service) StartContext(ctx context.Context) error {
+	return s.startContext(ctx, true, nil)
+}
+
+// PrepareContext starts the service and runs Init without publishing its name.
+// The caller owns the prepared service and must Stop it when it is no longer needed.
+func (s *Service) PrepareContext(ctx context.Context) error {
+	return s.startContext(ctx, false, nil)
+}
+
+// PublishReplacement publishes a running service by name. If the name is already
+// occupied, it may only replace previous. The caller manages the lifetime of previous.
+func (s *Service) PublishReplacement(previous *Service) error {
+	return s.publishReplacement(previous, nil, nil)
+}
+
+func (s *Service) publishReplacement(previous *Service, reservation *NameReservation, commit func()) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.State() != StateRunning {
+		return ErrServiceNotRunning
+	}
+	return globalReg.register(s.name, s, previous, reservation, commit)
+}
+
+func (s *Service) startContext(ctx context.Context, publish bool, releaseName func()) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// 串行化 Start/Stop：避免 Stop 关闭 quit 之后 Start 又把循环拉起来，
 	// 也避免并发 Stop 重复 close(quit) 导致 panic。
 	s.lifecycleMu.Lock()
 
-	if s.stopped {
+	if s.stopDone != nil {
 		s.lifecycleMu.Unlock()
 		err := fmt.Errorf("service %s: Stop has been called, restart is not allowed", s.name)
 		s.Warn("start rejected: %v", err)
 		return err
 	}
 
-	if !s.state.CompareAndSwap(int32(StateStopped), int32(StateRunning)) {
+	if !s.state.CompareAndSwap(int32(StateStopped), int32(StateStarting)) {
 		s.lifecycleMu.Unlock()
 		err := fmt.Errorf("service %s already started", s.name)
 		s.Warn("start rejected: %v", err)
 		return err
 	}
 
-	if err := globalReg.register(s.name, s); err != nil {
-		s.state.Store(int32(StateStopped))
-		s.lifecycleMu.Unlock()
-		wrapped := fmt.Errorf("register %s: %w", s.name, err)
-		s.Error("register failed: %v", wrapped)
-		return wrapped
+	if publish {
+		if err := globalReg.register(s.name, s, nil, nil, nil); err != nil {
+			s.state.Store(int32(StateStopped))
+			s.lifecycleMu.Unlock()
+			wrapped := fmt.Errorf("register %s: %w", s.name, err)
+			s.Error("register failed: %v", wrapped)
+			return wrapped
+		}
 	}
 
-	s.wg.Add(1)
+	initCtx, cancelInit := context.WithCancel(ctx)
+	s.initCancel = cancelInit
+	s.releaseName = releaseName
+	s.wg.Add(2) // 消息循环和初始化
 	go s.loop()
+	s.lifecycleMu.Unlock()
 
-	initErr := s.runInit()
+	initErr := s.runInit(initCtx, cancelInit)
+	s.lifecycleMu.Lock()
+	if initErr == nil {
+		initErr = initCtx.Err()
+	}
+	if initErr == nil {
+		s.initialized.Store(true)
+		s.state.Store(int32(StateRunning))
+		if s.config.MonitorInterval > 0 {
+			s.wg.Add(1)
+			go s.monitor()
+		}
+	}
+	s.wg.Done()
+	s.lifecycleMu.Unlock()
 	if initErr != nil {
-		// 必须先释放 lifecycleMu 再调用 Stop（Stop 会重新获取同一把锁）。
-		s.lifecycleMu.Unlock()
 		s.Stop()
 		return fmt.Errorf("init %s: %w", s.name, initErr)
 	}
-
-	if s.config.MonitorInterval > 0 {
-		s.wg.Add(1)
-		go s.monitor()
-	}
-
-	s.lifecycleMu.Unlock()
 
 	s.Info("started (queue=%d)", s.config.QueueSize)
 	return nil
 }
 
-func (s *Service) runInit() error {
-	<-s.execToken
-	state := &handlerExecState{owner: s, done: make(chan struct{})}
+func (s *Service) runInit(initCtx context.Context, cancelInit context.CancelFunc) (err error) {
+	select {
+	case <-initCtx.Done():
+		return initCtx.Err()
+	case <-s.execToken:
+	}
+	id := goid.Get()
+	s.executions.Store(id, struct{}{})
+	defer s.executions.Delete(id)
+	defer s.enterInitLookup(id)()
+	state := &handlerExecState{owner: s, initializing: true, done: make(chan struct{})}
 	defer s.finishHandler(state)
-	ctx := context.WithValue(context.Background(), handlerCtxKey{}, state)
+	defer func() {
+		if value := recover(); value != nil {
+			err = fmt.Errorf("panic in Init: %v", value)
+			s.Error("init failed: %v", err)
+		}
+		if err != nil {
+			cancelInit()
+		}
+	}()
+	ctx := context.WithValue(initCtx, initScopeKey{}, initScope{service: s, done: initCtx.Done()})
+	ctx = context.WithValue(ctx, handlerCtxKey{}, state)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	s.Info("initializing...")
 
@@ -462,29 +675,47 @@ func (s *Service) runInit() error {
 	return nil
 }
 
+// Stop closes admission and waits for the shared shutdown to complete or reach its drain limit.
+// A direct call from this service's handler or Init starts shutdown and returns so that execution can exit.
 func (s *Service) Stop() {
+	done := s.beginStop()
+	if done == nil {
+		return
+	}
+	if _, executing := s.executions.Load(goid.Get()); !executing {
+		<-done
+	}
+}
+
+func (s *Service) beginStop() <-chan struct{} {
 	s.lifecycleMu.Lock()
 
-	if s.stopped {
-		// 已经停过：quit/monitorQuit 不能重复 close，直接返回。
+	if done := s.stopDone; done != nil {
 		s.lifecycleMu.Unlock()
-		return
+		return done
 	}
 
 	s.admissionMu.Lock()
-	stopping := s.state.CompareAndSwap(int32(StateRunning), int32(StateStopping))
+	state := s.State()
+	stopping := state == StateRunning || state == StateStarting
+	if stopping {
+		s.state.Store(int32(StateStopping))
+	}
 	s.admissionMu.Unlock()
 	if !stopping {
 		// 未启动或已处于停止流程，不关闭任何 channel。
 		s.lifecycleMu.Unlock()
-		return
+		return nil
 	}
 
-	// 进入停止流程即标记为终态：Start 会拒绝再次启动，避免
-	// "loop 立刻退出 + 二次 Stop 重复 close" 的组合。
-	s.stopped = true
+	stopDone := make(chan struct{})
+	s.stopDone = stopDone
+	if s.initCancel != nil {
+		s.initCancel()
+		s.initCancel = nil
+	}
 
-	globalReg.unregister(s.name)
+	globalReg.unregister(s.name, s)
 
 	if s.config.MonitorInterval > 0 {
 		close(s.monitorQuit)
@@ -492,8 +723,17 @@ func (s *Service) Stop() {
 
 	close(s.quit)
 
+	releaseName := s.releaseName
+	s.releaseName = nil
 	s.lifecycleMu.Unlock()
+	defer func() { go s.waitForStop(stopDone) }()
+	if releaseName != nil {
+		releaseName()
+	}
+	return stopDone
+}
 
+func (s *Service) waitForStop(stopDone chan<- struct{}) {
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -508,6 +748,7 @@ func (s *Service) Stop() {
 	}
 
 	s.state.Store(int32(StateStopped))
+	close(stopDone)
 }
 
 // ==================== 消息循环 ====================
@@ -552,7 +793,13 @@ func (s *Service) startHandler(msg *ServiceMsg) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		state := &handlerExecState{owner: s, done: make(chan struct{})}
+		id := goid.Get()
+		s.executions.Store(id, struct{}{})
+		defer s.executions.Delete(id)
+		if msg.initCall {
+			defer s.enterInitLookup(id)()
+		}
+		state := &handlerExecState{owner: s, initializing: msg.initCall, done: make(chan struct{})}
 		defer s.finishHandler(state)
 		s.handleOne(msg, state)
 	}()
@@ -612,9 +859,8 @@ func (s *Service) handleOne(msg *ServiceMsg, state *handlerExecState) {
 
 func (s *Service) handlerTimeout(method string) time.Duration {
 	s.timeoutsMu.RLock()
-	timeout, ok := s.methodTimeouts[method]
-	s.timeoutsMu.RUnlock()
-	if ok {
+	defer s.timeoutsMu.RUnlock()
+	if timeout, ok := s.methodTimeouts[method]; ok {
 		return timeout
 	}
 	return s.config.HandlerTimeout
@@ -622,9 +868,8 @@ func (s *Service) handlerTimeout(method string) time.Duration {
 
 func (s *Service) callTimeout(method string) time.Duration {
 	s.timeoutsMu.RLock()
-	timeout, ok := s.callTimeouts[method]
-	s.timeoutsMu.RUnlock()
-	if ok {
+	defer s.timeoutsMu.RUnlock()
+	if timeout, ok := s.callTimeouts[method]; ok {
 		return timeout
 	}
 	return s.config.CallTimeout
@@ -655,6 +900,10 @@ func (s *Service) sendResponse(msg *ServiceMsg, data any, err error) {
 }
 
 func (s *Service) drainRemaining(pending *ServiceMsg) {
+	if !s.initialized.Load() {
+		s.discardQueuedMessages()
+		return
+	}
 	deadline := time.Now().Add(s.config.DrainTimeout)
 	drained := 0
 	msg := pending
@@ -670,30 +919,36 @@ func (s *Service) drainRemaining(pending *ServiceMsg) {
 			}
 		}
 
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			s.Warn("drain timeout: %d messages dropped", len(s.msgCh)+1)
-			return
+		if remaining := time.Until(deadline); remaining > 0 {
+			select {
+			case <-s.execToken:
+				drained++
+				s.startHandler(msg)
+				msg = nil
+				continue
+			case <-time.After(remaining):
+			}
 		}
-
-		select {
-		case <-s.execToken:
-		case <-time.After(remaining):
-			s.Warn("drain timeout: %d messages dropped", len(s.msgCh)+1)
-			return
-		}
-
-		drained++
-		s.startHandler(msg)
-		msg = nil
+		s.Warn("drain timeout: %d messages dropped", 1+s.discardQueuedMessages())
+		return
 	}
+}
+
+func (s *Service) discardQueuedMessages() int {
+	// Stop has closed admission and the service loop is the only receiver.
+	count := len(s.msgCh)
+	for range count {
+		<-s.msgCh
+	}
+	return count
 }
 
 // tryEnqueue 只在 Stop 开始排空前接受消息，且在持锁期间不等待队列空间。
 func (s *Service) tryEnqueue(msg *ServiceMsg) error {
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
-	if s.state.Load() != int32(StateRunning) {
+	state := s.State()
+	if state != StateRunning && !(state == StateStarting && msg.initCall) {
 		return ErrServiceNotRunning
 	}
 	select {
@@ -713,34 +968,39 @@ func (s *Service) RawCall(ctx context.Context, method string, args any) (any, er
 	if ctx != nil && ctx.Value(handlerCtxKey{}) != nil {
 		return nil, ErrExternalOnly
 	}
-	return s.rawCall(ctx, method, args)
+	return s.rawCall(ctx, method, args, false)
 }
 
 func (s *Service) Call(ctx context.Context, targetService, method string, args any) (any, error) {
-	if s.state.Load() != int32(StateRunning) {
+	state := handlerStateFromContext(ctx)
+	callerState := s.State()
+	initializing := callerState == StateStarting && state != nil && state.owner == s && state.initializing
+	if callerState != StateRunning && !initializing {
 		return nil, ErrCallerNotRunning
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	target, ok := globalReg.get(targetService)
+	target, ok := s.resolveTarget(targetService)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrServiceNotFound, targetService)
 	}
 
-	if target.state.Load() != int32(StateRunning) {
-		return nil, fmt.Errorf("%w: %s (state=%d)", ErrServiceNotRunning, targetService, target.state.Load())
+	initCall := initializing && target == s
+	targetState := target.State()
+	if targetState != StateRunning && !(targetState == StateStarting && initCall) {
+		return nil, fmt.Errorf("%w: %s (state=%d)", ErrServiceNotRunning, targetService, targetState)
 	}
 
-	if state := handlerStateFromContext(ctx); state != nil {
+	if state != nil {
 		if err := s.claimHandlerToken(state); err != nil {
 			return nil, err
 		}
 		defer s.releaseHandlerToken(state)
 	}
 
-	return target.rawCall(ctx, method, args)
+	return target.rawCall(ctx, method, args, initCall)
 }
 
 // claimHandlerToken 校验上下文属于 s 且尚未被并发使用，然后临时释放执行令牌。
@@ -794,7 +1054,7 @@ func (s *Service) finishHandler(state *handlerExecState) {
 	}
 }
 
-func (s *Service) rawCall(parent context.Context, method string, args any) (any, error) {
+func (s *Service) rawCall(parent context.Context, method string, args any, initCall bool) (any, error) {
 	session := s.nextSession()
 	rspCh := make(chan *ServiceMsg, 1)
 
@@ -809,8 +1069,9 @@ func (s *Service) rawCall(parent context.Context, method string, args any) (any,
 		Method:  method,
 		Data:    args,
 		// Handler 继承调用方的上下文，CallTimeout 仍只约束等响应的时间。
-		ctx:   parent,
-		rspCh: rspCh,
+		ctx:      parent,
+		rspCh:    rspCh,
+		initCall: initCall,
 	}
 
 	if ctx.Err() != nil {
@@ -906,11 +1167,12 @@ func (s *Service) RawSend(ctx context.Context, method string, args any) error {
 }
 
 func (s *Service) Send(targetService, method string, args any) error {
-	if s.state.Load() != int32(StateRunning) {
+	state := s.State()
+	if state != StateRunning && state != StateStarting {
 		return ErrCallerNotRunning
 	}
 
-	target, ok := globalReg.get(targetService)
+	target, ok := s.resolveTarget(targetService)
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrServiceNotFound, targetService)
 	}
@@ -933,6 +1195,13 @@ func (s *Service) Send(targetService, method string, args any) error {
 
 // ==================== 内部工具 ====================
 
+func (s *Service) resolveTarget(name string) (*Service, bool) {
+	if name == s.name {
+		return s, true
+	}
+	return globalReg.get(name)
+}
+
 func (s *Service) nextSession() string {
 	seed := s.sessionSeed.Add(1)
 	return fmt.Sprintf("%s-%d-%d", s.name, time.Now().UnixNano(), seed)
@@ -943,8 +1212,17 @@ func (s *Service) nextSession() string {
 func (s *Service) State() ServiceState { return ServiceState(s.state.Load()) }
 func (s *Service) IsRunning() bool     { return s.state.Load() == int32(StateRunning) }
 func (s *Service) Name() string        { return s.name }
-func (s *Service) QueueLen() int       { return len(s.msgCh) }
-func (s *Service) QueueCap() int       { return cap(s.msgCh) }
+func (s *Service) QueueLen() int {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	return len(s.msgCh)
+}
+
+func (s *Service) QueueCap() int {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	return cap(s.msgCh)
+}
 
 // ==================== 指标快照 ====================
 
@@ -960,8 +1238,10 @@ type MetricsSnapshot struct {
 }
 
 func (s *Service) Snapshot() MetricsSnapshot {
+	s.admissionMu.Lock()
 	ql := len(s.msgCh)
 	qc := cap(s.msgCh)
+	s.admissionMu.Unlock()
 	pct := 0
 	if qc > 0 {
 		pct = ql * 100 / qc

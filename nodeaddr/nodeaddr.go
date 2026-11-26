@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -26,27 +27,51 @@ type NodeAddr struct {
 }
 
 // Validate 校验该地址能否安全地拼装成跨进程传递的 "host:port"。
-// String 不做校验（保持零失败的值方法），需要校验的构造方显式调用本方法。
+// 需要处理校验错误的构造方应先调用本方法，再调用 String。
 func (a NodeAddr) Validate() error {
-	if a.Host == "" {
-		return errors.New("nodeaddr: empty host")
+	_, err := a.normalized()
+	return err
+}
+
+func (a NodeAddr) normalized() (NodeAddr, error) {
+	host, err := normalizeHost(a.Host)
+	if err != nil {
+		return NodeAddr{}, err
 	}
 	if a.Port < 1 || a.Port > 65535 {
-		return fmt.Errorf("nodeaddr: invalid port %d", a.Port)
+		return NodeAddr{}, fmt.Errorf("nodeaddr: invalid port %d", a.Port)
+	}
+	a.Host = host
+	return a, nil
+}
+
+func normalizeHost(host string) (string, error) {
+	if host == "" {
+		return "", errors.New("nodeaddr: empty host")
 	}
 	// Host 里出现这些字符说明传入的其实是 URL / etcd key / JSON 片段 / 带括号的
 	// IPv6 字面量，拼进 JoinHostPort 后会得到无法解析的地址。
-	if strings.ContainsAny(a.Host, " \t\r\n/{}[]\"") || strings.Contains(a.Host, "://") {
-		return fmt.Errorf("nodeaddr: invalid host %q", a.Host)
+	if strings.ContainsAny(host, " \t\r\n/{}[]\"@?#\\") {
+		return "", fmt.Errorf("nodeaddr: invalid host %q", host)
 	}
-	return nil
+	if strings.Contains(host, ":") {
+		addr, err := netip.ParseAddr(host)
+		if err != nil {
+			return "", fmt.Errorf("nodeaddr: invalid IPv6 host %q: %w", host, err)
+		}
+		return addr.String(), nil
+	}
+	return host, nil
 }
 
 // String 是唯一的地址拼装点。
-// IPv4 / 主机名输出与原来的 fmt.Sprintf("%s:%d") 完全一致；IPv6 字面量会自动
-// 补方括号（原来的写法会拼出无法拨号的 "::1:8080"）。
+// IPv6 字面量会统一写法并补方括号，zone 随地址保留。
 func (a NodeAddr) String() string {
-	return net.JoinHostPort(a.Host, strconv.Itoa(a.Port))
+	host := a.Host
+	if normalized, err := normalizeHost(host); err == nil {
+		host = normalized
+	}
+	return net.JoinHostPort(host, strconv.Itoa(a.Port))
 }
 
 // ParseNodeAddr 是唯一的地址解析点。
@@ -71,9 +96,5 @@ func ParseNodeAddr(s string) (NodeAddr, error) {
 	if err != nil {
 		return NodeAddr{}, fmt.Errorf("nodeaddr: invalid port %q in %q", portStr, s)
 	}
-	na := NodeAddr{Host: host, Port: port}
-	if err := na.Validate(); err != nil {
-		return NodeAddr{}, err
-	}
-	return na, nil
+	return (NodeAddr{Host: host, Port: port}).normalized()
 }

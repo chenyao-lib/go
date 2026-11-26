@@ -54,7 +54,7 @@
 //
 // 简单程序可调用 Init 创建包级 Default，然后用 watcher.GetNode。Init 支持
 // HashRing 和 RoundRobin。需要多个前缀、不同策略或明确管理生命周期时，应使用
-// NewWatcher；使用 Default 的程序退出时也应调用 watcher.Default.Close()。
+// NewWatcher；使用默认实例的程序退出时应通过 DefaultWatcher 取出并关闭它。
 package watcher
 
 import (
@@ -88,7 +88,7 @@ type ServerInfo struct {
 // 监听 etcd 特定 prefix 下的节点变化，将节点列表同步到指定的 SelectStrategy 中
 type NodeWatcher struct {
 	cli    *clientv3.Client
-	prefix string // 调用方传入的原始前缀，仅用于日志与 key 解析
+	prefix string // 调用方传入的原始前缀，仅用于日志
 	// watchPrefix 是实际用于 etcd Get/Watch 的前缀，恒以 "/" 结尾。
 	// 不补分隔符时，兄弟命名空间会被当成节点（见 normalizeWatchPrefix）。
 	watchPrefix string
@@ -96,11 +96,13 @@ type NodeWatcher struct {
 	strategy    SelectStrategy
 	ctx         context.Context // 生命周期 context，仅 Close 时取消（与租约解耦）
 	cancel      context.CancelFunc
-	startOnce   sync.Once
+	startMu     sync.Mutex
+	started     bool
 	closeOnce   sync.Once
+	closeErr    error
 
 	// mu 保护 keyAddrs，并保证「缓存变更 + 策略变更」成对生效。
-	mu sync.Mutex
+	mu sync.RWMutex
 	// keyAddrs: etcd key -> 该 key 最近一次 Put / 全量同步解析出的地址。
 	// Delete 事件据此用同一个 addr 移除节点，不再依赖 key 后缀恰好等于地址。
 	keyAddrs map[string]string
@@ -109,7 +111,7 @@ type NodeWatcher struct {
 // NodeWatcherOption 函数式选项
 type NodeWatcherOption func(*NodeWatcher)
 
-// WithHashRing 使用一致性哈希环策略
+// WithHashRing 使用一致性哈希环策略。virtualNodes 为非正数时使用默认值 150。
 func WithHashRing(virtualNodes int) NodeWatcherOption {
 	return func(nw *NodeWatcher) {
 		nw.strategy = NewConsistentHash(virtualNodes)
@@ -185,6 +187,7 @@ func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOptio
 		return nil, errors.New("etcd client error: " + err.Error())
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	// 默认使用轮询策略
 	nw := &NodeWatcher{
 		cli:         cli,
@@ -192,6 +195,8 @@ func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOptio
 		watchPrefix: normalizeWatchPrefix(prefix),
 		leaseTTL:    leaseTTL,
 		strategy:    NewRoundRobinStrategy(),
+		ctx:         ctx,
+		cancel:      cancel,
 		keyAddrs:    make(map[string]string),
 	}
 
@@ -209,59 +214,59 @@ func NewWatcher(endpoints, prefix string, leaseTTL int, opts ...NodeWatcherOptio
 // Start 启动节点发现：
 //  1. 加载已有 node
 //  2. 启动 watch（断线自动重连 + 全量重新同步）
+//
+// 初次加载失败可以再次调用 Start；不再使用时应调用 Close。
 func (nw *NodeWatcher) Start() error {
-	var startErr error
-	// startOnce 防重入：重复 Start 会覆盖 ctx/cancel 并启动多个 watch 协程。
-	nw.startOnce.Do(func() {
-		// 1. 生命周期 context：仅 Close 时取消。
-		// 旧实现把 watch 挂在租约保活的 context 上——etcd 重启/网络抖动导致
-		// keepalive 停止时会 cancel 掉 watch，节点列表从此冻结（错过的增删
-		// 永远补不上，哈希环里出现指向已死实例的僵尸节点）。现已解耦。
-		nw.ctx, nw.cancel = context.WithCancel(context.Background())
-
-		// 2. 加载已有 node（2s 超时，失败立即退出）
-		getCtx, getCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer getCancel()
-		if err := nw.loadNodes(getCtx); err != nil {
-			log.Error("初始节点加载失败: prefix=%s, err=%v", nw.prefix, err)
-			nw.cancel()
-			nw.cli.Close()
-			startErr = err
-			return
-		}
-
-		// 3. 启动 watcher
-		go nw.watchNodes()
-		log.Info("节点发现启动成功: prefix=%q, watchPrefix=%q, strategy=%T, nodes=%d", nw.prefix, nw.watchPrefix, nw.strategy, len(nw.Nodes()))
-	})
-	return startErr
+	nw.startMu.Lock()
+	defer nw.startMu.Unlock()
+	if err := nw.ctx.Err(); err != nil {
+		return err
+	}
+	if nw.started {
+		return nil
+	}
+	getCtx, getCancel := context.WithTimeout(nw.ctx, 2*time.Second)
+	defer getCancel()
+	revision, err := nw.loadNodes(getCtx)
+	if err != nil {
+		log.Error("初始节点加载失败: prefix=%s, err=%v", nw.prefix, err)
+		return err
+	}
+	if err := nw.ctx.Err(); err != nil {
+		return err
+	}
+	nw.started = true
+	go nw.watchNodes(revision)
+	log.Info("节点发现启动成功: prefix=%q, watchPrefix=%q, strategy=%T, nodes=%d", nw.prefix, nw.watchPrefix, nw.strategy, len(nw.Nodes()))
+	return nil
 }
 
 // Close 关闭节点发现器
 func (nw *NodeWatcher) Close() error {
-	var err error
 	nw.closeOnce.Do(func() {
 		log.Info("正在关闭节点发现: prefix=%s", nw.prefix)
-		if nw.cancel != nil {
-			nw.cancel()
-		}
-		err = nw.cli.Close()
-		if err != nil {
-			log.Error("关闭节点发现失败: prefix=%s, err=%v", nw.prefix, err)
+		nw.cancel()
+		nw.closeErr = nw.cli.Close()
+		if nw.closeErr != nil {
+			log.Error("关闭节点发现失败: prefix=%s, err=%v", nw.prefix, nw.closeErr)
 		} else {
 			log.Info("节点发现已关闭: prefix=%s", nw.prefix)
 		}
 	})
-	return err
+	return nw.closeErr
 }
 
 // GetNode 根据 key 获取目标节点
 func (nw *NodeWatcher) GetNode(key string) string {
+	nw.mu.RLock()
+	defer nw.mu.RUnlock()
 	return nw.strategy.GetNode(key)
 }
 
 // Nodes 返回所有节点列表
 func (nw *NodeWatcher) Nodes() []string {
+	nw.mu.RLock()
+	defer nw.mu.RUnlock()
 	return nw.strategy.Nodes()
 }
 
@@ -308,57 +313,37 @@ func parseNodeAddr(value []byte) string {
 	return na.String()
 }
 
-// extractAddrFromKey 从 etcd key 中提取 node 地址。
-// 仅用作 Delete 事件缓存未命中时的兜底；正常路径由 keyAddrs 提供地址，
-// 不再要求 key 格式必须是 {ServicePrefix}/{addr}。
-func extractAddrFromKey(key, serverPrefix string) string {
-	prefix := serverPrefix + "/"
-	if addr := strings.TrimPrefix(key, prefix); addr != key {
-		return addr
-	}
-	return strings.TrimPrefix(key, serverPrefix)
-}
-
 // watchNodes 监听 etcd 中 node 的增删变化。
 // watch 断开（etcd 重启、网络抖动、watch 粒度重建等导致 channel 关闭）后
 // 自动重连并全量重新同步节点——否则断连期间错过的增删会让本地列表永久冻结。
-func (nw *NodeWatcher) watchNodes() {
+func (nw *NodeWatcher) watchNodes(revision int64) {
 	log.Info("etcd watch nodes started, prefix=%q, watchPrefix=%q", nw.prefix, nw.watchPrefix)
 
 	const retryDelay = 2 * time.Second
 
 	for nw.ctx.Err() == nil {
-		watchChan := nw.cli.Watch(nw.ctx, nw.watchPrefix, clientv3.WithPrefix())
-
-		// 每轮都"先建 watch 再全量同步"：快照与 watch 建立之间的事件由
-		// channel 缓冲补放，配合 AddNode 去重 / RemoveNode 幂等保证最终一致。
-		// 若反过来先同步后建 watch，两步之间的事件会永久丢失。首轮也不例外
-		// （Start 的初始 loadNodes 与这里建 watch 之间同样存在窗口）。
-		// 同步失败时保留旧节点列表：先 Reset 再请求会在 etcd 短暂不可用时
-		// 把策略清空，造成重连窗口内所有 GetNode 返回空、业务直接拒绝服务。
-		syncCtx, syncCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := nw.loadNodes(syncCtx); err != nil {
-			log.Error("watch 节点全量同步失败(保留现有节点，断线后将继续重试): prefix=%s, err=%v", nw.prefix, err)
-		}
-		syncCancel()
-
-		for wresp := range watchChan {
-			if wresp.Err() != nil {
-				log.Error("watch nodes error: %+v", wresp.Err())
-				continue
+		if revision == 0 {
+			syncCtx, syncCancel := context.WithTimeout(nw.ctx, 5*time.Second)
+			var err error
+			revision, err = nw.loadNodes(syncCtx)
+			syncCancel()
+			if err != nil && nw.ctx.Err() == nil {
+				log.Error("watch 节点全量同步失败，保留现有节点: prefix=%s, err=%v", nw.prefix, err)
 			}
-			nw.applyEvents(wresp.Events)
+		}
+		if revision > 0 && nw.ctx.Err() == nil {
+			nw.watchFrom(revision)
+			revision = 0
 		}
 
-		// channel 关闭：要么正在 Close（ctx 已取消），要么 etcd 连接断开
 		if nw.ctx.Err() != nil {
 			break
 		}
 		log.Warn("etcd watch 断开, %s 后重连并全量同步节点: prefix=%s", retryDelay, nw.prefix)
 
-		time.Sleep(retryDelay)
-		if nw.ctx.Err() != nil {
-			break
+		select {
+		case <-nw.ctx.Done():
+		case <-time.After(retryDelay):
 		}
 	}
 
@@ -369,32 +354,49 @@ func (nw *NodeWatcher) watchNodes() {
 	}
 }
 
+func (nw *NodeWatcher) watchFrom(snapshotRevision int64) {
+	watchCtx, cancel := context.WithCancel(nw.ctx)
+	defer cancel()
+	// revision + 1 衔接快照与 Watch，补齐两步之间发生的变更。
+	watchChan := nw.cli.Watch(watchCtx, nw.watchPrefix, clientv3.WithPrefix(), clientv3.WithRev(snapshotRevision+1))
+	for response := range watchChan {
+		if err := response.Err(); err != nil {
+			log.Error("watch nodes error: %v", err)
+			return
+		}
+		nw.applyEvents(response.Events, snapshotRevision)
+	}
+}
+
 // applyEvents 把一批 watch 事件应用到节点策略。
 // key -> addr 的配对由 watcher 自己维护：Put 时记录，Delete 时用同一个 addr 移除。
 // 这样共享库 etcd/register 官方示例里的逻辑名 key（services/gateway/gw-01）
 // 也能正确删除，不会再因为「从 key 截出来的字符串 != 从 value 解析出的地址」
 // 而在哈希环里留下幽灵节点。
-func (nw *NodeWatcher) applyEvents(events []*clientv3.Event) {
+func (nw *NodeWatcher) applyEvents(events []*clientv3.Event, snapshotRevision int64) {
 	nw.mu.Lock()
 	defer nw.mu.Unlock()
 	for _, ev := range events {
+		if ev.Kv.ModRevision <= snapshotRevision {
+			continue
+		}
 		key := string(ev.Kv.Key)
 		switch ev.Type {
 		case clientv3.EventTypePut:
 			addr := parseNodeAddr(ev.Kv.Value)
-			if addr == "" {
-				log.Error("parse node addr failed (keep last known node), key=%s value=%s", key, string(ev.Kv.Value))
+			if addr != "" {
+				if old, ok := nw.keyAddrs[key]; ok && old != addr {
+					nw.removeAddrIfUnused(key, old)
+					log.Info("node addr changed: key=%s old=%s new=%s", key, old, addr)
+				}
+				nw.keyAddrs[key] = addr
+				nw.strategy.AddNode(addr)
+				log.Info("Added node: %s", addr)
 				continue
 			}
-			if old, ok := nw.keyAddrs[key]; ok && old != addr {
-				// 同一 key 的地址变了（运行时改 IP/端口、或 value 被改写）：
-				// 先撤掉旧地址，否则它会作为幽灵节点永久留在环里。
-				nw.removeAddrIfUnused(key, old)
-				log.Info("node addr changed: key=%s old=%s new=%s", key, old, addr)
-			}
-			nw.keyAddrs[key] = addr
-			nw.strategy.AddNode(addr)
-			log.Info("Added node: %s", addr)
+			// 无效记录和全量同步一样，不参与路由。
+			log.Error("parse node addr failed, key=%s value=%s", key, string(ev.Kv.Value))
+			fallthrough
 		case clientv3.EventTypeDelete:
 			addr, ok := nw.keyAddrs[key]
 			if ok {
@@ -406,11 +408,7 @@ func (nw *NodeWatcher) applyEvents(events []*clientv3.Event) {
 				}
 				continue
 			}
-			// 缓存未命中：只收到 Delete 而没见过对应 Put（watch 从较新 revision
-			// 起步、或 key 由外部写入）。退回 key 解析并明确告警。
-			fallback := extractAddrFromKey(key, nw.prefix)
-			nw.strategy.RemoveNode(fallback)
-			log.Warn("delete event without cached addr, fallback to key: key=%s addr=%s (若 key 与 value 地址不一致可能删不掉)", key, fallback)
+			log.Debug("ignore removal of uncached node: key=%s", key)
 		}
 	}
 }
@@ -435,12 +433,16 @@ type nodeEntry struct {
 
 // fetchNodes 从 etcd 拉取 prefix 下的全部 key -> addr 配对。
 // 只有请求成功才返回结果；失败时调用方应保留策略中的现有节点。
-func (nw *NodeWatcher) fetchNodes(ctx context.Context) ([]nodeEntry, error) {
+func (nw *NodeWatcher) fetchNodes(ctx context.Context) ([]nodeEntry, int64, error) {
 	log.Info("loading existing nodes from etcd...")
 
 	resp, err := nw.cli.Get(ctx, nw.watchPrefix, clientv3.WithPrefix())
 	if err != nil {
-		return nil, errors.New("etcd get nodes error: " + err.Error())
+		return nil, 0, errors.New("etcd get nodes error: " + err.Error())
+	}
+	revision := resp.Header.GetRevision()
+	if revision <= 0 {
+		return nil, 0, errors.New("etcd node snapshot is missing a revision")
 	}
 
 	entries := make([]nodeEntry, 0, len(resp.Kvs))
@@ -452,17 +454,17 @@ func (nw *NodeWatcher) fetchNodes(ctx context.Context) ([]nodeEntry, error) {
 			log.Error("parse node addr failed, key=%s value=%s", string(kv.Key), string(kv.Value))
 		}
 	}
-	return entries, nil
+	return entries, revision, nil
 }
 
 // loadNodes 从 etcd 全量同步 node 到策略。
 // 先请求成功再 Reset + 重建，避免 etcd 短暂不可用时把已有节点清空。
 // 缓存与策略在同一把锁下重建，避免两者出现不一致的版本，导致后续 Delete
 // 又用旧地址去删节点。
-func (nw *NodeWatcher) loadNodes(ctx context.Context) error {
-	entries, err := nw.fetchNodes(ctx)
+func (nw *NodeWatcher) loadNodes(ctx context.Context) (int64, error) {
+	entries, revision, err := nw.fetchNodes(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	nw.mu.Lock()
@@ -475,7 +477,7 @@ func (nw *NodeWatcher) loadNodes(ctx context.Context) error {
 		log.Info("Loaded node: %s (key=%s)", e.addr, e.key)
 	}
 	log.Info("loaded %d nodes", len(entries))
-	return nil
+	return revision, nil
 }
 
 // ────────────────────────────────────────────
@@ -492,14 +494,24 @@ const (
 	RoundRobin
 )
 
+var defaultMu sync.RWMutex
+
+// Default is the legacy default instance. Use DefaultWatcher for concurrent access.
 var Default *NodeWatcher
 
-// Init 初始化默认全局 watcher
+// DefaultWatcher returns the current default instance, or nil before Init succeeds.
+func DefaultWatcher() *NodeWatcher {
+	defaultMu.RLock()
+	defer defaultMu.RUnlock()
+	return Default
+}
+
+// Init 启动新的默认 watcher，成功后替换并关闭旧实例。
 func Init(etcdEndpoints, serverPrefix string, leaseTTL int, strategyType StrategyType) error {
 	var opt NodeWatcherOption
 	switch strategyType {
 	case HashRing:
-		opt = WithHashRing(150)
+		opt = WithHashRing(defaultVirtualNodes)
 	case RoundRobin:
 		opt = WithRoundRobin()
 	default:
@@ -511,16 +523,23 @@ func Init(etcdEndpoints, serverPrefix string, leaseTTL int, strategyType Strateg
 		return err
 	}
 	if err := nw.Start(); err != nil {
+		_ = nw.Close()
 		return err
 	}
+	defaultMu.Lock()
+	previous := Default
 	Default = nw
+	defaultMu.Unlock()
+	if previous != nil {
+		_ = previous.Close()
+	}
 	return nil
 }
 
 // GetNode 使用默认 watcher 获取节点
 func GetNode(key string) string {
-	if Default != nil {
-		return Default.GetNode(key)
+	if current := DefaultWatcher(); current != nil {
+		return current.GetNode(key)
 	}
 	return ""
 }

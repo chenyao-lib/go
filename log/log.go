@@ -5,7 +5,7 @@
 //   - 零配置启动：即使不调用 Init，也会使用默认配置（./logs 目录、100MB 滚动、DEBUG 级别）。
 //     Init 之前的日志先暂存在内存（同时输出控制台），宽限 1 秒内仍未 Init 才按默认配置落盘，
 //     因此不会因为启动期日志而多出一个默认前缀的文件。
-//   - 非阻塞写入：所有日志写入操作均通过通道发送到后台协程，用户协程永不阻塞。
+//   - 非阻塞写入：日志通过通道交给后台协程。队列满时丢弃新日志，由后台汇总丢弃数量。
 //   - 并发安全：所有公开函数均可安全地在多个 goroutine 中同时调用。
 //   - 动态配置：可在运行时调整级别、保留策略、缓冲参数等，无需重启。
 //   - 优雅关闭：Close 会等待所有已入队日志写入完成，确保数据不丢失。
@@ -36,7 +36,7 @@
 package log
 
 import (
-	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -112,7 +112,8 @@ type Logger struct {
 	// 以下字段仅在后台协程中访问，或受 mu 保护
 	logFile      *os.File
 	logTime      time.Time
-	bufw         *bufio.Writer
+	bufw         *fileBuffer
+	retired      *retiredLogFile
 	flushTicker  *time.Ticker
 	flushDone    chan struct{}
 	reopen       bool // 标记是否需要重新打开文件（配置变更时置 true）
@@ -130,15 +131,28 @@ type Logger struct {
 
 	// 异步通道
 	logCh  chan string
-	stopCh chan struct{} // Close 时关闭，通知后台协程退出（不关闭 logCh，避免并发 send panic）
-	closed atomic.Bool   // 标记已 Close，Write 据此直接丢弃后续日志
+	stopCh chan struct{}
+	sendMu sync.RWMutex // 将入队与关闭接收串行化
+	closed atomic.Bool
 	wg     sync.WaitGroup
+
+	dropped     atomic.Uint64
+	dropPending chan struct{} // 唤醒后台汇报，最多保留一个通知
 }
+
+type retiredLogFile struct {
+	file    *os.File
+	buffer  *fileBuffer
+	retryAt time.Time
+}
+
+const retiredLogRetryInterval = time.Second
 
 // std 是包级默认实例，在 init 中初始化并启动后台协程。
 var std = &Logger{
-	logCh:  make(chan string, defaultChanCap),
-	stopCh: make(chan struct{}),
+	logCh:       make(chan string, defaultChanCap),
+	stopCh:      make(chan struct{}),
+	dropPending: make(chan struct{}, 1),
 }
 
 // init 在包加载时自动设置默认配置并启动后台写入协程，实现零配置可用。
@@ -189,7 +203,7 @@ func resolveInitGrace() time.Duration {
 //   - maxBackups: 保留的备份文件数量（不含当前日志），0 表示不限制。
 //   - maxAge: 备份文件的最大保留时间（如 7*24*time.Hour），0 表示不限制。
 //
-// 注意：若调用时已有文件打开，会平滑切换到新配置（关闭旧文件，创建新文件），
+// 注意：若调用时已有文件打开，会在新文件可写后切换到新配置。
 // 切换过程中已入队的日志不会丢失。Init 之前产生的日志会暂存在内存中，并在
 // Init 时写入新配置的文件，因此"包 init() 先打日志、main 里再 Init"的程序
 // 不会在当天同时留下默认前缀与 Init 前缀两个日志文件。
@@ -224,14 +238,14 @@ func Init(prefix, dir string, maxSize int64, lv Level, maxBackups int, maxAge ti
 	std.level.Store(int32(lv))
 
 	std.initialized = true
+	std.reopen = true
 	std.stopPendingTimerLocked()
 	now := time.Now().In(newCfg.location)
 
-	// Init 前已有日志：立即关闭可能存在的旧文件、按新配置打开文件并补写暂存
+	// Init 前已有日志：按新配置打开文件并补写暂存
 	// 内容。这样启动期日志直接进入 Init 指定的文件，不会先落到默认 prefix 的
 	// 文件里，同一天也就不会出现两个日志文件。
 	if len(std.pendingLines) > 0 {
-		std.closeFileLocked()
 		if err := std.rotate(now); err != nil {
 			fmt.Fprintf(os.Stderr, "open logfile error: %v\n", err)
 			// 保留暂存内容，下一条日志打开文件后会补写，避免丢失启动日志。
@@ -241,9 +255,6 @@ func Init(prefix, dir string, maxSize int64, lv Level, maxBackups int, maxAge ti
 				std.startFlusher()
 			}
 		}
-	} else {
-		// 标记需要重新打开文件（因为 dir 或 prefix 可能变化）
-		std.reopen = true
 	}
 
 	// 立即执行一次清理（使用新配置）
@@ -283,7 +294,7 @@ func SetRetention(maxBackups int, maxAge time.Duration) {
 //   - bufSize: 缓冲区大小（字节）。>0 时启用缓冲，<=0 时不缓冲（直接写文件）。
 //   - flushInterval: 定时刷新间隔。>0 时启用定时刷新，<=0 则禁用定时刷新（仅在缓冲区满时刷新）。
 //
-// 注意：此函数会立即重建缓冲区（如果文件已打开），下一条日志将使用新缓冲设置。
+// 文件已打开时，调整会保留尚未写入的日志，后续写入使用新的缓冲大小。
 func SetBufferConfig(bufSize int, flushInterval time.Duration) {
 	std.mu.Lock()
 	defer std.mu.Unlock()
@@ -302,21 +313,13 @@ func SetBufferConfig(bufSize int, flushInterval time.Duration) {
 	}
 	std.config.Store(&newCfg)
 
-	// 如果文件已打开，立即重建刷新器（并重建 buffer，在后台协程中会应用）
+	// 如果文件已打开，保留未写入的字节并更新缓冲大小和刷新器。
 	if std.logFile != nil {
 		std.stopFlusher()
+		std.bufw.limit = newCfg.bufSize
+		std.flushLocked()
 		if newCfg.flushInterval > 0 {
 			std.startFlusher()
-		}
-		// 重建 bufw 由后台协程在下次写入时完成（需设置 reopen 或直接处理？）
-		// 但为了立即生效，我们直接重建 bufw，因为持有锁且文件已打开
-		if std.bufw != nil {
-			std.bufw.Flush()
-		}
-		if newCfg.bufSize > 0 {
-			std.bufw = bufio.NewWriterSize(std.logFile, newCfg.bufSize)
-		} else {
-			std.bufw = nil
 		}
 	}
 }
@@ -380,17 +383,14 @@ var closeOnce sync.Once
 // 应在程序退出前调用（通常使用 defer）。调用后再写入的日志会被直接丢弃（不会 panic）。
 //
 // 幂等：重复调用安全（仅首次生效），因此可同时被 defer 与 Fatal/FatalM 调用。
-//
-// 实现说明：这里关闭的是 stopCh 而不是 logCh。若关闭 logCh，其它协程在关闭瞬间仍执行到
-// Write 里的 select { case logCh <- line }，会触发 send on closed channel panic（select 的
-// default 无法兜住）；改为"发信号 + 后台协程排空通道"，任何并发写入都是安全的。
 func Close() {
 	closeOnce.Do(func() {
+		std.sendMu.Lock()
 		std.closed.Store(true)
-		// 发信号通知后台协程退出（不关闭 logCh）
 		if std.stopCh != nil {
 			close(std.stopCh)
 		}
+		std.sendMu.Unlock()
 		// 等待后台协程排空已入队日志并退出
 		std.wg.Wait()
 
@@ -398,17 +398,7 @@ func Close() {
 		std.mu.Lock()
 		defer std.mu.Unlock()
 		std.stopPendingTimerLocked()
-		std.stopFlusher()
-		if std.bufw != nil {
-			std.bufw.Flush()
-			std.bufw = nil
-		}
-		if std.logFile != nil {
-			if err := std.logFile.Close(); err != nil {
-				fmt.Fprintf(os.Stderr, "close logfile error: %v\n", err)
-			}
-			std.logFile = nil
-		}
+		std.closeFileLocked()
 	})
 }
 
@@ -466,13 +456,13 @@ func Debug(format string, args ...any) {
 // 该函数会被 Info/Error/Warn/Debug 调用，也可直接使用以实现自定义标签或格式。
 // 注意：如果 lv 低于当前设置的最低级别，该调用会被忽略（快速返回）。
 //
-// 并发安全且非阻塞。
+// 并发安全，队列满时直接丢弃，由后台汇总。
 func Write(lv Level, levelTag string, leadingSpace bool, format string, args ...any) {
 	if lv < Level(std.level.Load()) {
 		return
 	}
 
-	// 已 Close：直接丢弃，避免往无人消费的通道堆积（也避免打满缓冲后刷屏 stderr）
+	// 已 Close：直接丢弃，避免往无人消费的通道堆积。
 	if std.closed.Load() {
 		return
 	}
@@ -495,12 +485,19 @@ func Write(lv Level, levelTag string, leadingSpace bool, format string, args ...
 	prefix := t.Format(timestampLayout) + "|" + levelTag
 	line := prefix + caller + msg + stack + "\r\n"
 
-	// 非阻塞发送到通道
+	std.sendMu.RLock()
+	defer std.sendMu.RUnlock()
+	if std.closed.Load() {
+		return
+	}
 	select {
 	case std.logCh <- line:
 	default:
-		// 通道已满，丢弃日志并输出到 stderr（避免业务阻塞）
-		fmt.Fprintf(os.Stderr, "[LOG DROPPED] %s", line)
+		std.dropped.Add(1)
+		select {
+		case std.dropPending <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -622,6 +619,8 @@ func (l *Logger) backgroundWriter() {
 		select {
 		case msg := <-l.logCh:
 			l.handle(msg)
+		case <-l.dropPending:
+			l.reportDropped()
 		case <-l.stopCh:
 			// 收到关闭信号：先把通道中已入队的日志排空，再退出。
 			// 注意不要关闭 logCh —— 那会让关闭瞬间仍在 Write 的协程 panic。
@@ -630,11 +629,20 @@ func (l *Logger) backgroundWriter() {
 				case msg := <-l.logCh:
 					l.handle(msg)
 				default:
+					l.reportDropped()
 					l.flushAndClose()
 					return
 				}
 			}
 		}
+	}
+}
+
+func (l *Logger) reportDropped() {
+	if count := l.dropped.Swap(0); count != 0 {
+		cfg := l.config.Load().(*config)
+		stamp := time.Now().In(cfg.location).Format(timestampLayout)
+		l.handle(fmt.Sprintf("%s|WARN%s [LOG DROPPED] %d messages (log queue full)\r\n", stamp, getCaller(1), count))
 	}
 }
 
@@ -645,13 +653,6 @@ func (l *Logger) handle(msg string) {
 
 	cfg := l.config.Load().(*config)
 
-	// 处理配置变更（重新打开文件）
-	if l.reopen {
-		l.reopen = false
-		// 关闭旧文件并重置缓冲区
-		l.closeFileLocked()
-	}
-
 	now := time.Now().In(cfg.location)
 
 	// Init 之前：日志只写控制台并暂存内存，不创建文件。宽限内 Init 时由 Init
@@ -659,6 +660,9 @@ func (l *Logger) handle(msg string) {
 	if !l.initialized && l.logFile == nil {
 		l.bufferBeforeInitLocked(msg, now, cfg)
 		return
+	}
+	if cfg.console {
+		defer fmt.Print(msg)
 	}
 
 	// 如果文件未打开，打开它（使用当前时间）
@@ -676,40 +680,29 @@ func (l *Logger) handle(msg string) {
 		// 调用，而 rotate() 只在 logFile == nil（首次打开 / reopen）时执行，
 		// 导致进程跨天不换文件、单文件可远超 maxSize
 		// （线上实测 app_20261016.log 涨到 421MB，配置上限 100MB）。
-		// 轮转失败只报错并继续写旧文件，避免丢日志。
+		// 轮转失败时报告错误，并在旧文件仍可用时继续写入。
 		if err := l.rotate(now); err != nil {
 			fmt.Fprintf(os.Stderr, "rotate logfile error: %v\n", err)
 		}
 	}
 
+	if l.logFile == nil {
+		return
+	}
 	// 补写 Init 时打开文件失败而遗留的暂存日志
 	l.writePendingLocked()
-
-	// 写入文件（经过 buffer）
-	if l.bufw != nil {
-		if _, err := l.bufw.WriteString(msg); err != nil {
-			fmt.Fprintf(os.Stderr, "write buffer error: %v\n", err)
-			// 尝试直接写文件
-			if l.logFile != nil {
-				l.logFile.WriteString(msg)
-			}
-		}
-		// 如果缓冲区满，立即刷新
-		if l.bufw.Buffered() >= cfg.bufSize {
-			if err := l.bufw.Flush(); err != nil {
-				fmt.Fprintf(os.Stderr, "flush buffer error: %v\n", err)
-			}
-		}
-	} else if l.logFile != nil {
-		if _, err := l.logFile.WriteString(msg); err != nil {
-			fmt.Fprintf(os.Stderr, "write logfile error: %v\n", err)
-		}
+	if len(l.pendingLines) == 0 {
+		l.writeLineLocked(msg)
 	}
+	l.retryRetiredLogLocked(now)
+}
 
-	// 控制台输出
-	if cfg.console {
-		fmt.Print(msg)
+func (l *Logger) writeLineLocked(line string) (int, error) {
+	n, err := l.bufw.WriteString(line)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "write logfile %q: %v\n", l.logFile.Name(), err)
 	}
+	return n, err
 }
 
 // bufferBeforeInitLocked 在 Init 尚未调用时暂存日志，并在宽限到期或缓冲溢出时
@@ -725,7 +718,7 @@ func (l *Logger) bufferBeforeInitLocked(msg string, now time.Time, cfg *config) 
 
 	// 关闭缓冲（initGrace<=0）、缓冲溢出或已超过宽限：按默认配置落盘。
 	if l.initGrace <= 0 || len(l.pendingLines) >= maxPendingLines || now.Sub(l.pendingSince) >= l.initGrace {
-		l.fallbackToDefaultFileLocked(now)
+		l.flushPendingToFileLocked(now)
 		return
 	}
 	if l.pendingTimer == nil {
@@ -747,12 +740,12 @@ func (l *Logger) onPendingGraceTimeout() {
 		return
 	}
 	cfg := l.config.Load().(*config)
-	l.fallbackToDefaultFileLocked(time.Now().In(cfg.location))
+	l.flushPendingToFileLocked(time.Now().In(cfg.location))
 }
 
-// fallbackToDefaultFileLocked 用当前配置（未 Init 时为默认 prefix=log）打开文件
+// flushPendingToFileLocked 用当前配置（未 Init 时为默认 prefix=log）打开文件
 // 并补写暂存日志。调用方必须持有 mu 且此时 logFile 为 nil。
-func (l *Logger) fallbackToDefaultFileLocked(now time.Time) {
+func (l *Logger) flushPendingToFileLocked(now time.Time) {
 	l.stopPendingTimerLocked()
 	l.pendingSince = time.Time{}
 
@@ -764,7 +757,7 @@ func (l *Logger) fallbackToDefaultFileLocked(now time.Time) {
 		return
 	}
 	l.writePendingLocked()
-	if l.flushTicker == nil && cfg.flushInterval > 0 {
+	if !l.closed.Load() && l.flushTicker == nil && cfg.flushInterval > 0 {
 		l.startFlusher()
 	}
 }
@@ -775,26 +768,19 @@ func (l *Logger) writePendingLocked() {
 	if len(l.pendingLines) == 0 {
 		return
 	}
-	for _, line := range l.pendingLines {
-		if l.bufw != nil {
-			if _, err := l.bufw.WriteString(line); err != nil {
-				fmt.Fprintf(os.Stderr, "write buffer error: %v\n", err)
-				if l.logFile != nil {
-					l.logFile.WriteString(line)
-				}
-			}
-		} else if l.logFile != nil {
-			if _, err := l.logFile.WriteString(line); err != nil {
-				fmt.Fprintf(os.Stderr, "write logfile error: %v\n", err)
-			}
+	for len(l.pendingLines) != 0 {
+		line := l.pendingLines[0]
+		n, err := l.writeLineLocked(line)
+		if n == len(line) {
+			l.pendingLines[0] = ""
+			l.pendingLines = l.pendingLines[1:]
+		}
+		if err != nil {
+			return
 		}
 	}
 	l.pendingLines = nil
-	if l.bufw != nil {
-		if err := l.bufw.Flush(); err != nil {
-			fmt.Fprintf(os.Stderr, "flush buffer error: %v\n", err)
-		}
-	}
+	l.flushLocked()
 }
 
 // stopPendingTimerLocked 停止宽限兜底定时器。
@@ -808,17 +794,66 @@ func (l *Logger) stopPendingTimerLocked() {
 // closeFileLocked 停止刷新器并关闭当前文件，调用方必须持有 mu。
 func (l *Logger) closeFileLocked() {
 	l.stopFlusher()
-	if l.bufw != nil {
-		l.bufw.Flush()
-		l.bufw = nil
+	l.closeLogFileLocked()
+	l.closeRetiredLogLocked()
+}
+
+func (l *Logger) flushLocked() error {
+	if l.bufw == nil {
+		return nil
 	}
-	if l.logFile != nil {
-		if err := l.logFile.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "close old logfile error: %v\n", err)
+	if err := l.bufw.Flush(); err != nil {
+		name := "<unknown>"
+		if l.logFile != nil {
+			name = l.logFile.Name()
 		}
+		fmt.Fprintf(os.Stderr, "flush logfile %q: %v\n", name, err)
+		return err
+	}
+	return nil
+}
+
+// closeLogFileLocked closes the file without stopping the periodic flusher during rotation.
+func (l *Logger) closeLogFileLocked() {
+	if err := l.flushLocked(); err != nil {
+		l.flushLocked()
+	}
+	l.bufw = nil
+	if l.logFile != nil {
+		closeLogFile(l.logFile)
 		l.logFile = nil
 		l.logTime = time.Time{}
 	}
+}
+
+func closeLogFile(file *os.File) {
+	if err := file.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "close logfile %q: %v\n", file.Name(), err)
+	}
+}
+
+func (l *Logger) retryRetiredLogLocked(now time.Time) {
+	old := l.retired
+	if old == nil || now.Before(old.retryAt) {
+		return
+	}
+	if err := old.buffer.Flush(); err != nil && old.buffer.Buffered() != 0 {
+		old.retryAt = now.Add(retiredLogRetryInterval)
+		return
+	}
+	l.closeRetiredLogLocked()
+}
+
+func (l *Logger) closeRetiredLogLocked() {
+	old := l.retired
+	if old == nil {
+		return
+	}
+	if err := old.buffer.Flush(); err != nil {
+		fmt.Fprintf(os.Stderr, "flush retired logfile %q: %v (%d unwritten bytes)\n", old.file.Name(), err, old.buffer.Buffered())
+	}
+	closeLogFile(old.file)
+	l.retired = nil
 }
 
 // flushAndClose 退出前刷新缓冲区并关闭文件。
@@ -827,22 +862,20 @@ func (l *Logger) flushAndClose() {
 	defer l.mu.Unlock()
 
 	l.stopPendingTimerLocked()
-	// 从未 Init 且仍有暂存日志：Close 前按默认配置落盘，避免短命进程丢日志。
-	if !l.initialized && len(l.pendingLines) > 0 {
-		cfg := l.config.Load().(*config)
-		l.fallbackToDefaultFileLocked(time.Now().In(cfg.location))
+	// Init 打开文件失败时也可能保留了启动日志，关闭前再尝试一次。
+	if len(l.pendingLines) > 0 {
+		if l.logFile == nil {
+			cfg := l.config.Load().(*config)
+			l.flushPendingToFileLocked(time.Now().In(cfg.location))
+		} else {
+			l.writePendingLocked()
+		}
+	}
+	if l.logFile != nil && len(l.pendingLines) > 0 {
+		l.writePendingLocked()
 	}
 
-	l.stopFlusher()
-	if l.bufw != nil {
-		l.bufw.Flush()
-		l.bufw = nil
-	}
-	if l.logFile != nil {
-		l.logFile.Close()
-		l.logFile = nil
-		l.logTime = time.Time{}
-	}
+	l.closeFileLocked()
 }
 
 // ---------- 轮转与清理 ----------
@@ -851,50 +884,59 @@ func (l *Logger) rotate(t time.Time) error {
 	if !l.needRotate(t) {
 		return nil
 	}
-
 	cfg := l.config.Load().(*config)
+	baseName := fmt.Sprintf("%s_%04d%02d%02d", cfg.prefix, t.Year(), t.Month(), t.Day())
+	fileName := filepath.Join(cfg.dir, baseName+".log")
+	sameFile := sameLogFile(l.logFile, fileName)
+	flushErr := l.flushLocked()
+	if flushErr != nil && (!l.reopen || sameFile) {
+		return fmt.Errorf("flush before rotating: %w", flushErr)
+	}
 
 	if err := os.MkdirAll(cfg.dir, 0755); err != nil {
 		return fmt.Errorf("create log dir[%s]: %w", cfg.dir, err)
 	}
 
-	baseName := fmt.Sprintf("%s_%04d%02d%02d", cfg.prefix, t.Year(), t.Month(), t.Day())
-	fileName := filepath.Join(cfg.dir, baseName+".log")
-
-	// 先落盘并关闭旧文件：Windows 下句柄未释放时 os.Rename 会失败
-	// （"The process cannot access the file because it is being used by
-	// another process"），Linux 上则无所谓。统一先关再改名，跨平台一致。
-	if l.bufw != nil {
-		l.bufw.Flush()
-		l.bufw = nil
-	}
-	if l.logFile != nil {
-		if err := l.logFile.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "close old logfile error: %v\n", err)
-		}
-		l.logFile = nil
+	var fallbackPath string
+	oldTime := l.logTime
+	if sameFile {
+		// Windows requires closing the active handle before renaming that file.
+		fallbackPath = l.logFile.Name()
+		l.closeLogFileLocked()
 	}
 
 	// 超过 maxSize 时把当前文件转成 _N 备份。改名失败不阻断日志写入：
 	// 继续往原文件追加，总比丢日志好。
-	if err := rotateFileIfNeeded(fileName, cfg.dir, baseName, cfg.maxSize); err != nil {
+	backupPath, err := rotateFileIfNeeded(fileName, cfg.dir, baseName, cfg.maxSize)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "rotate logfile error: %v\n", err)
+	}
+	if fallbackPath != "" && backupPath != "" {
+		fallbackPath = backupPath
 	}
 
 	f, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
-		return fmt.Errorf("open logfile[%s]: %w", fileName, err)
+		openErr := fmt.Errorf("open logfile[%s]: %w", fileName, err)
+		if fallbackPath != "" {
+			previous, reopenErr := os.OpenFile(fallbackPath, os.O_WRONLY|os.O_APPEND, 0)
+			if reopenErr != nil {
+				return errors.Join(openErr, fmt.Errorf("reopen previous logfile[%s]: %w", fallbackPath, reopenErr))
+			}
+			l.setLogFileLocked(previous, oldTime, cfg.bufSize)
+		}
+		return openErr
 	}
-
-	l.logFile = f
-	l.logTime = t
-
-	// 重建缓冲（根据当前 bufSize）
-	if cfg.bufSize > 0 {
-		l.bufw = bufio.NewWriterSize(f, cfg.bufSize)
+	if flushErr != nil && l.bufw.Buffered() != 0 {
+		// A path change can recover logging while the old sink is unhealthy.
+		// Keep one old file so its unwritten suffix can still be retried in place.
+		l.closeRetiredLogLocked()
+		l.retired = &retiredLogFile{file: l.logFile, buffer: l.bufw, retryAt: t.Add(retiredLogRetryInterval)}
 	} else {
-		l.bufw = nil
+		l.closeLogFileLocked()
 	}
+	l.setLogFileLocked(f, t, cfg.bufSize)
+	l.reopen = false
 
 	// 维护 <prefix>_latest.log 硬链接，固定指向当前文件。软链接在 Windows 需要
 	// 建链特权，硬链接同目录、同卷即可，普通账户可用；不支持硬链接的文件系统
@@ -904,6 +946,24 @@ func (l *Logger) rotate(t time.Time) error {
 
 	l.cleanupOldFiles(t)
 	return nil
+}
+
+func sameLogFile(file *os.File, path string) bool {
+	if file == nil {
+		return false
+	}
+	current, currentErr := file.Stat()
+	target, targetErr := os.Stat(path)
+	if currentErr == nil && targetErr == nil {
+		return os.SameFile(current, target)
+	}
+	return filepath.Clean(file.Name()) == filepath.Clean(path)
+}
+
+func (l *Logger) setLogFileLocked(f *os.File, t time.Time, bufSize int) {
+	l.logFile = f
+	l.logTime = t
+	l.bufw = newFileBuffer(f, bufSize)
 }
 
 // latestLinkPath 返回固定指向当前日志文件的硬链接路径。
@@ -976,7 +1036,7 @@ func (l *Logger) warnLatestLinkLocked(action string, err error) {
 }
 
 func (l *Logger) needRotate(t time.Time) bool {
-	if l.logFile == nil {
+	if l.logFile == nil || l.reopen {
 		return true
 	}
 	if l.logTime.Year() != t.Year() ||
@@ -1000,26 +1060,26 @@ func (l *Logger) needRotate(t time.Time) bool {
 	return size >= cfg.maxSize
 }
 
-func rotateFileIfNeeded(fileName, dir, baseName string, maxSize int64) error {
+func rotateFileIfNeeded(fileName, dir, baseName string, maxSize int64) (string, error) {
 	stat, err := os.Stat(fileName)
 	if os.IsNotExist(err) {
-		return nil
+		return "", nil
 	}
 	if err != nil {
-		return fmt.Errorf("stat logfile[%s]: %w", fileName, err)
+		return "", fmt.Errorf("stat logfile[%s]: %w", fileName, err)
 	}
-	if stat.Size() < maxSize {
-		return nil
+	if !stat.Mode().IsRegular() || stat.Size() < maxSize {
+		return "", nil
 	}
 
 	bak, err := nextBackupName(dir, baseName)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Rename(fileName, bak); err != nil {
-		return fmt.Errorf("rename logfile[%s] to [%s]: %w", fileName, bak, err)
+		return "", fmt.Errorf("rename logfile[%s] to [%s]: %w", fileName, bak, err)
 	}
-	return nil
+	return bak, nil
 }
 
 func nextBackupName(dir, baseName string) (string, error) {
@@ -1154,11 +1214,8 @@ func (l *Logger) flushLoop(ticker *time.Ticker, done <-chan struct{}) {
 		select {
 		case <-ticker.C:
 			l.mu.Lock()
-			if l.bufw != nil {
-				if err := l.bufw.Flush(); err != nil {
-					fmt.Fprintf(os.Stderr, "background flush error: %v\n", err)
-				}
-			}
+			l.flushLocked()
+			l.retryRetiredLogLocked(time.Now())
 			l.mu.Unlock()
 		case <-done:
 			return

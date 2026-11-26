@@ -84,6 +84,7 @@ import (
 	"github.com/chenyao-lib/go/log"
 
 	"github.com/coder/websocket"
+	"github.com/outrigdev/goid"
 )
 
 type RPCMessage struct {
@@ -108,21 +109,25 @@ var ErrAuthRejected = errors.New("authentication rejected by server")
 type AuthPayloadFunc func(c *WSClient) (any, error)
 
 type WSClient struct {
-	Addr       string
-	ClientType string
-	ClientId   string
-	Conn       *websocket.Conn
-	IP         string
-	Port       int
-	SendCh     chan []byte // 当前连接的发送队列，每次重连更换
-	Ctx        context.Context
-	Cancel     context.CancelFunc
-	mu         sync.RWMutex
-	isReady    bool
-	connDone   <-chan struct{}
-	connCtx    context.Context
-	outbound   *outboundQueue
-	codec      payloadcodec.Codec
+	Addr         string
+	ClientType   string
+	ClientId     string
+	Conn         *websocket.Conn
+	IP           string
+	Port         int
+	SendCh       chan []byte // 当前连接的发送队列，每次重连更换
+	Ctx          context.Context
+	Cancel       context.CancelFunc
+	mu           sync.RWMutex
+	isReady      bool
+	authConn     *websocket.Conn // dialed connection until authentication completes, guarded by mu
+	connCtx      context.Context
+	outbound     *outboundQueue
+	codec        payloadcodec.Codec
+	pumpsDone    map[chan struct{}]struct{} // current and draining connections, guarded by mu
+	closeOnce    sync.Once
+	closeDone    chan struct{}
+	handlerPumps sync.Map // goroutine ID of each running handler pump
 
 	pending     map[string]chan *RPCMessage
 	pendingMu   sync.Mutex
@@ -135,6 +140,7 @@ type WSClient struct {
 	handlerQueueSize atomic.Int64
 
 	closed              atomic.Bool  // 标记是否已彻底关闭
+	running             atomic.Bool  // 同一客户端仅允许运行一个连接循环
 	readLimit           int64        // 读大小限制
 	writeTimeout        atomic.Int64 // 写超时，默认5秒
 	defaultCallTimeout  atomic.Int64 // Call 默认超时，默认5秒
@@ -450,6 +456,9 @@ func (c *WSClient) callDoneError(ctx context.Context, timeoutMsg string) error {
 }
 
 func (c *WSClient) otherResponse(msg *RPCMessage) bool {
+	if msg.Session == "" || msg.Method != "" || (len(msg.Data) != 0 && !json.Valid(msg.Data)) {
+		return false
+	}
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
 	ch, exists := c.pending[msg.Session]
@@ -480,25 +489,8 @@ func (c *WSClient) meResponse(ctx context.Context, sendCh chan<- []byte, session
 		var marshalErr error
 		dataBytes, marshalErr = json.Marshal(data)
 		if marshalErr != nil {
-			log.Error("meResponse: json.Marshal failed: %v", marshalErr)
-			// 发送错误响应
-			errRsp := RPCMessage{
-				Session: session,
-				Error:   fmt.Sprintf("marshal response failed: %v", marshalErr),
-			}
-			b, encodeErr := c.marshalRPCMessage(errRsp)
-			if encodeErr != nil {
-				log.Error("meResponse: marshal error response failed: %v", encodeErr)
-				return
-			}
-			select {
-			case sendCh <- b:
-			case <-time.After(time.Duration(c.writeTimeout.Load())):
-				log.Warn("meResponse: send response timeout for session %s", session)
-			case <-ctx.Done():
-				log.Warn("meResponse: connection closed, drop response for session %s", session)
-			}
-			return
+			log.Error("meResponse: json.Marshal failed: session=%s, err=%v", session, marshalErr)
+			err = fmt.Errorf("marshal response failed: %v", marshalErr)
 		}
 	}
 
@@ -510,8 +502,16 @@ func (c *WSClient) meResponse(ctx context.Context, sendCh chan<- []byte, session
 		rsp.Error = err.Error()
 	}
 	b, encodeErr := c.marshalRPCMessage(rsp)
+	if encodeErr != nil && (len(rsp.Data) != 0 || rsp.Error == "") {
+		log.Error("meResponse: marshal response failed: session=%s, err=%v", session, encodeErr)
+		rsp.Data = nil
+		if rsp.Error == "" {
+			rsp.Error = "encode response failed"
+		}
+		b, encodeErr = c.marshalRPCMessage(rsp)
+	}
 	if encodeErr != nil {
-		log.Error("meResponse: marshal response failed: %v", encodeErr)
+		log.Error("meResponse: marshal error response failed: session=%s, err=%v", session, encodeErr)
 		return
 	}
 	select {
@@ -552,11 +552,10 @@ func (c *WSClient) dialTimeoutPeriod() time.Duration {
 // NewClient 初始化客户端（在这里绑定 Context）
 func NewClient(ctx context.Context, host string, clientType string, clientId string) *WSClient {
 	// 创建一个继承自传入 ctx 的子 context
-	var addr string
-	if strings.Contains(host, "://") {
-		addr = host
-	} else {
-		addr = fmt.Sprintf("ws://%s/ws", host) // 自动补全
+	addr := host
+	if !strings.Contains(host, "://") {
+		target := url.URL{Scheme: "ws", Host: host, Path: "/ws"}
+		addr = target.String()
 	}
 	cCtx, cCancel := context.WithCancel(ctx)
 
@@ -586,35 +585,59 @@ func NewClient(ctx context.Context, host string, clientType string, clientId str
 	return c
 }
 
-// ========== 修改后 ==========
+// Close stops reconnecting and waits up to five seconds for connection pumps to exit.
+// A connection still authenticating is closed immediately.
+// A handler calling Close initiates shutdown and returns so its pump can exit.
 func (c *WSClient) Close() {
-	if !c.closed.CompareAndSwap(false, true) {
-		return
+	c.closeOnce.Do(func() {
+		c.closeDone = make(chan struct{})
+		c.mu.Lock()
+		c.closed.Store(true)
+		authConn := c.authConn
+		c.authConn = nil
+		pending := make([]<-chan struct{}, 0, len(c.pumpsDone))
+		for done := range c.pumpsDone {
+			pending = append(pending, done)
+		}
+		c.mu.Unlock()
+
+		log.Info("正在关闭客户端: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
+		c.Cancel()
+		if authConn != nil {
+			_ = authConn.CloseNow()
+		}
+		go c.waitForClose(pending)
+	})
+	if _, insideHandler := c.handlerPumps.Load(goid.Get()); !insideHandler {
+		<-c.closeDone
 	}
-	log.Info("正在关闭客户端: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
-	c.Cancel()
-	c.mu.RLock()
-	done := c.connDone
-	c.mu.RUnlock()
-	c.waitDoneWithTimeout(done, 5*time.Second, "close: wait goroutine exit timeout")
-	log.Info("客户端已关闭: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
+}
+
+func (c *WSClient) waitForClose(pending []<-chan struct{}) {
+	defer close(c.closeDone)
+	defer log.Info("客户端已关闭: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for _, done := range pending {
+		select {
+		case <-done:
+		case <-timer.C:
+			log.Warn("close: wait goroutine exit timeout")
+			return
+		}
+	}
 }
 
 // IsReady 返回当前底层连接是否就绪（已连接且未主动关闭）
 func (c *WSClient) IsReady() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.isReady
+	return c.isReady && c.Conn != nil && c.connCtx != nil && c.connCtx.Err() == nil && !c.closed.Load()
 }
 
 // IsConnected 返回客户端是否处于可用状态：连接就绪且客户端未被关闭
 func (c *WSClient) IsConnected() bool {
-	if c.closed.Load() {
-		return false
-	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.isReady && c.Conn != nil
+	return c.IsReady()
 }
 
 // cleanPendingWithError 当连接断开时，让所有未完成的 Call 返回错误
@@ -630,7 +653,22 @@ func (c *WSClient) cleanPendingWithError(errMsg string) {
 	}
 }
 
+// Start 运行连接和重连循环。同一客户端已有循环运行时，重复调用直接返回。
+// onConnected 串行异步执行。回调执行期间发生多次重连时，只保留最新会话的待执行通知。
+// 回调使用 IsReady、Send、Call 等方法访问当前会话。Conn、IP、Port、SendCh 和 HandlerCh
+// 等字段会在重连时更新，运行期间不能直接并发访问。
 func (c *WSClient) Start(onConnected func(*WSClient)) {
+	if c.closed.Load() || !c.running.CompareAndSwap(false, true) {
+		return
+	}
+	defer c.running.Store(false)
+
+	var connected chan context.Context
+	if onConnected != nil {
+		connected = make(chan context.Context, 1)
+		go c.notifyConnections(connected, onConnected)
+		defer close(connected)
+	}
 	log.Info("客户端运行循环启动: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
 	defer log.Info("客户端运行循环退出: addr=%s, type=%s, id=%s", c.Addr, c.ClientType, c.ClientId)
 
@@ -683,11 +721,27 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 			continue
 		}
 
+		c.mu.Lock()
+		if c.closed.Load() || c.Ctx.Err() != nil {
+			c.mu.Unlock()
+			_ = conn.CloseNow()
+			return
+		}
+		c.authConn = conn
+		c.mu.Unlock()
+
 		// 设置读限制
 		conn.SetReadLimit(c.readLimit)
 
-		if err := c.auth(conn, time.Duration(c.writeTimeout.Load())); err != nil {
-			conn.CloseNow()
+		// Payload preparation may block before auth starts any context-aware I/O.
+		stopAuthClose := context.AfterFunc(c.Ctx, func() { _ = conn.CloseNow() })
+		err = c.auth(conn, time.Duration(c.writeTimeout.Load()))
+		stopAuthClose()
+		if err != nil {
+			_ = conn.CloseNow()
+			c.mu.Lock()
+			c.authConn = nil
+			c.mu.Unlock()
 			if errors.Is(err, ErrAuthRejected) {
 				log.Error("认证被服务端拒绝: %v，客户端彻底停止", err)
 				c.Cancel()
@@ -712,8 +766,18 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 		connWG.Add(3)
 
 		c.mu.Lock()
+		c.authConn = nil
+		if c.closed.Load() || connCtx.Err() != nil {
+			c.mu.Unlock()
+			connCancel()
+			_ = conn.CloseNow()
+			return
+		}
 		c.Conn = conn
-		c.connDone = connDone
+		if c.pumpsDone == nil {
+			c.pumpsDone = make(map[chan struct{}]struct{})
+		}
+		c.pumpsDone[connDone] = struct{}{}
 		c.connCtx = connCtx
 		c.HandlerCh = handlerCh
 		c.SendCh = sendCh
@@ -746,12 +810,18 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 		go c.handlerPump(connCtx, handlerCh, sendCh, &connWG)
 		go func() {
 			connWG.Wait()
+			c.mu.Lock()
+			delete(c.pumpsDone, connDone)
 			close(connDone)
+			c.mu.Unlock()
 		}()
 
-		// 认证成功，调用回调
-		if onConnected != nil {
-			onConnected(c)
+		if connected != nil {
+			select {
+			case <-connected:
+			default:
+			}
+			connected <- connCtx
 		}
 
 		<-connCtx.Done()
@@ -762,7 +832,6 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 		c.mu.Lock()
 		if c.Conn == conn {
 			c.Conn = nil
-			c.connDone = nil
 			c.connCtx = nil
 			c.outbound = nil
 		}
@@ -787,6 +856,22 @@ func (c *WSClient) Start(onConnected func(*WSClient)) {
 			log.Info("🔄 连接异常断开，准备重连...")
 			// 删除多余的 sleep（指数退避已经处理了等待）
 		}
+	}
+}
+
+func (c *WSClient) notifyConnections(connected <-chan context.Context, onConnected func(*WSClient)) {
+	for connCtx := range connected {
+		if connCtx.Err() != nil {
+			continue
+		}
+		func() {
+			defer func() {
+				if value := recover(); value != nil {
+					log.Error("连接回调 panic: %v", value)
+				}
+			}()
+			onConnected(c)
+		}()
 	}
 }
 
@@ -848,6 +933,7 @@ func (c *WSClient) waitDoneWithTimeout(done <-chan struct{}, timeout time.Durati
 func (c *WSClient) WaitStopSignal() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stop)
 
 	select {
 	case <-stop:
@@ -977,11 +1063,17 @@ func (c *WSClient) enqueueTextMessage(ctx context.Context, handlerCh chan RPCMes
 
 func (c *WSClient) handlerPump(ctx context.Context, handlerCh <-chan RPCMessage, sendCh chan []byte, wg *sync.WaitGroup) {
 	defer wg.Done()
+	id := goid.Get()
+	c.handlerPumps.Store(id, struct{}{})
+	defer c.handlerPumps.Delete(id)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case msg := <-handlerCh:
+			if ctx.Err() != nil {
+				return
+			}
 			c.dispatchTextMessage(ctx, sendCh, msg)
 		}
 	}

@@ -9,7 +9,7 @@ import (
 // RoundRobinStrategy 轮询策略
 type RoundRobinStrategy struct {
 	nodes []string
-	index atomic.Int32
+	index atomic.Uint64
 	mu    sync.RWMutex
 }
 
@@ -61,7 +61,7 @@ func (s *RoundRobinStrategy) GetNode(_ string) string {
 	if n == 0 {
 		return ""
 	}
-	idx := int(s.index.Add(1)) % n
+	idx := s.index.Add(1) % uint64(n)
 	return s.nodes[idx]
 }
 

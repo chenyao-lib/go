@@ -48,7 +48,7 @@
 // # 表单接口
 //
 // CallFormMap 将业务请求编码到 application/x-www-form-urlencoded 的 __input
-// 字段，并将成功响应解析为 map[string]any。RequestForm 发送 multipart/form-data
+// 字段，并将包含整数 code 的成功响应解析为 map[string]any。RequestForm 发送 multipart/form-data
 // 字符串字段并返回原始响应体。两者都会把非 200 HTTP 状态作为错误返回。
 //
 // 所有请求的响应体读取上限为 8 MiB，超出时返回错误，避免异常服务端耗尽内存。
@@ -56,6 +56,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,14 +78,15 @@ type HttpClient struct {
 	httpClient *http.Client
 	encryptor  Encryptor
 
-	// VerifyResponse 非 nil 时，在返回业务数据前校验响应的 data、timestamp 和
-	// signature；返回错误会立即终止本次调用。内置 AES-CBC 不提供完整性校验，
-	// 旧协议无法替换加密方式时可用它发现密文篡改。
+	// VerifyResponse 非 nil 时，Call 和 CallFormMap 会先校验业务响应，再处理业务码
+	// 或返回数据。data 如果是 JSON 字符串，传入解码后的字符串；否则传入 data 的原始 JSON。
+	// 返回错误会立即终止本次调用。RequestForm 返回原始响应体，由调用方校验。
+	// 验签失败时，返回的错误也保留已接收的非 200 HTTP 状态。
 	VerifyResponse func(data string, ts int64, sig string) error
 }
 
 // HTTPStatusError 表示服务端返回了非 200 HTTP 状态码。
-// 响应体可能已被解析为业务信封，Body 保留原始字节便于诊断。
+// Body 保留完整的响应正文。正文读取失败时，返回的错误同时包含读取错误。
 type HTTPStatusError struct {
 	StatusCode int
 	Body       []byte
@@ -149,14 +151,24 @@ func NewHttpClient(timeoutSecs int, encryptor Encryptor) *HttpClient {
 	return client
 }
 
-// NewAesCipherClient creates a client using the built-in AES cipher.
+// NewAesCipherClient creates a client using the built-in AES cipher and
+// returns an error if the key cannot be used for AES.
 func NewAesCipherClient(timeoutSecs int, base64Key string) (*HttpClient, error) {
-	return NewHttpClient(timeoutSecs, NewAESCipher(base64Key)), nil
+	encryptor := NewAESCipher(base64Key)
+	if _, err := encryptor.key(); err != nil {
+		return nil, err
+	}
+	return NewHttpClient(timeoutSecs, encryptor), nil
 }
 
 // Call sends a JSON request using the API data envelope and decodes its
 // response into out.
-func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) (callErr error) {
+func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) error {
+	return c.CallContext(context.Background(), reqURL, reqBody, lang, out)
+}
+
+// CallContext is like Call, with request cancellation and deadlines from ctx.
+func (c *HttpClient) CallContext(ctx context.Context, reqURL string, reqBody any, lang string, out any) (callErr error) {
 	startedAt := time.Now()
 	defer func() {
 		if callErr != nil {
@@ -174,20 +186,19 @@ func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) (cal
 	if err != nil {
 		return fmt.Errorf("encode API request: %w", err)
 	}
-	apiResp, err := c.startRequest(reqURL, http.MethodPost, &apiRequest{
+	apiResp, err := c.startRequest(ctx, reqURL, http.MethodPost, &apiRequest{
 		Data:      data,
 		Timestamp: time.Now().UnixNano(),
 		Lang:      lang,
 	})
+	if apiResp != nil {
+		if verifyErr := c.verifyResponse(apiResp.Data, apiResp.Timestamp, apiResp.Signature); verifyErr != nil {
+			return retainHTTPStatus(err, verifyErr)
+		}
+	}
 	if err != nil {
-		if apiResp == nil || apiResp.Data == "" {
-			return err
-		}
-		if verifyErr := c.verifyResponse(apiResp); verifyErr != nil {
-			return verifyErr
-		}
-		if decErr := c.decryptData(apiResp.Data, out); decErr != nil {
-			return err
+		if apiResp != nil && apiResp.Data != "" {
+			_ = c.decryptData(apiResp.Data, out)
 		}
 		return err
 	}
@@ -200,9 +211,6 @@ func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) (cal
 		}
 		return &APIError{Code: apiResp.Code, Msg: apiResp.Msg}
 	}
-	if err := c.verifyResponse(apiResp); err != nil {
-		return err
-	}
 	if err := c.decryptData(apiResp.Data, out); err != nil {
 		return err
 	}
@@ -210,19 +218,33 @@ func (c *HttpClient) Call(reqURL string, reqBody any, lang string, out any) (cal
 }
 
 // verifyResponse 在解密前校验响应签名；未配置 VerifyResponse 时视为通过。
-func (c *HttpClient) verifyResponse(resp *apiResponse) error {
-	if c == nil || c.VerifyResponse == nil || resp == nil {
+func (c *HttpClient) verifyResponse(data string, timestamp int64, signature string) error {
+	if c == nil || c.VerifyResponse == nil {
 		return nil
 	}
-	if err := c.VerifyResponse(resp.Data, resp.Timestamp, resp.Signature); err != nil {
+	if err := c.VerifyResponse(data, timestamp, signature); err != nil {
 		return fmt.Errorf("verify API response signature: %w", err)
 	}
 	return nil
 }
 
+func retainHTTPStatus(requestErr, responseErr error) error {
+	var status *HTTPStatusError
+	if errors.As(requestErr, &status) {
+		// The request error may also include a business message whose signature failed.
+		return errors.Join(status, responseErr)
+	}
+	return responseErr
+}
+
 // CallFormMap sends reqBody in the __input form field and returns the decoded
 // response data as a map.
-func (c *HttpClient) CallFormMap(reqURL string, reqBody any) (result map[string]any, callErr error) {
+func (c *HttpClient) CallFormMap(reqURL string, reqBody any) (map[string]any, error) {
+	return c.CallFormMapContext(context.Background(), reqURL, reqBody)
+}
+
+// CallFormMapContext is like CallFormMap, with request cancellation and deadlines from ctx.
+func (c *HttpClient) CallFormMapContext(ctx context.Context, reqURL string, reqBody any) (result map[string]any, callErr error) {
 	startedAt := time.Now()
 	defer func() {
 		if callErr != nil {
@@ -240,22 +262,62 @@ func (c *HttpClient) CallFormMap(reqURL string, reqBody any) (result map[string]
 	if err != nil {
 		return nil, fmt.Errorf("encode form request: %w", err)
 	}
-	respBody, err := c.requestURLEncoded(reqURL, map[string]string{"__input": data})
-	if err != nil {
-		return nil, err
+	respBody, requestErr := c.requestURLEncoded(ctx, reqURL, map[string]string{"__input": data})
+	if requestErr != nil && (len(respBody) == 0 || c.VerifyResponse == nil) {
+		return nil, requestErr
 	}
 	var wrapper struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-		Data any    `json:"data"`
+		Code      *int            `json:"code"`
+		Msg       string          `json:"msg"`
+		Data      json.RawMessage `json:"data"`
+		Timestamp json.RawMessage `json:"timestamp"`
+		Signature json.RawMessage `json:"signature"`
 	}
 	if err := json.Unmarshal(respBody, &wrapper); err != nil {
+		if requestErr != nil {
+			return nil, requestErr
+		}
 		return nil, fmt.Errorf("parse encrypted form wrapper response: %w", err)
 	}
-	if wrapper.Code != 0 {
-		return nil, &APIError{Code: wrapper.Code, Msg: wrapper.Msg}
+	if c.VerifyResponse != nil {
+		data := string(wrapper.Data)
+		if len(wrapper.Data) > 0 && wrapper.Data[0] == '"' {
+			if err := json.Unmarshal(wrapper.Data, &data); err != nil {
+				return nil, retainHTTPStatus(requestErr, fmt.Errorf("parse form response data: %w", err))
+			}
+		}
+		var timestamp int64
+		if len(wrapper.Timestamp) != 0 {
+			if err := json.Unmarshal(wrapper.Timestamp, &timestamp); err != nil {
+				return nil, retainHTTPStatus(requestErr, fmt.Errorf("parse form response timestamp: %w", err))
+			}
+		}
+		var signature string
+		if len(wrapper.Signature) != 0 {
+			if err := json.Unmarshal(wrapper.Signature, &signature); err != nil {
+				return nil, retainHTTPStatus(requestErr, fmt.Errorf("parse form response signature: %w", err))
+			}
+		}
+		if err := c.verifyResponse(data, timestamp, signature); err != nil {
+			return nil, retainHTTPStatus(requestErr, err)
+		}
 	}
-	switch data := wrapper.Data.(type) {
+	if requestErr != nil {
+		return nil, requestErr
+	}
+	if wrapper.Code == nil {
+		return nil, errors.New("form response is missing a business code")
+	}
+	if *wrapper.Code != 0 {
+		return nil, &APIError{Code: *wrapper.Code, Msg: wrapper.Msg}
+	}
+	var value any
+	if len(wrapper.Data) != 0 {
+		if err := json.Unmarshal(wrapper.Data, &value); err != nil {
+			return nil, fmt.Errorf("parse form response data: %w", err)
+		}
+	}
+	switch data := value.(type) {
 	case nil:
 		return map[string]any{}, nil
 	case bool:
@@ -295,12 +357,12 @@ func (c *HttpClient) decode(data string) ([]byte, error) {
 	return c.encryptor.Decrypt(data)
 }
 
-func (c *HttpClient) requestURLEncoded(reqURL string, fields map[string]string) ([]byte, error) {
+func (c *HttpClient) requestURLEncoded(ctx context.Context, reqURL string, fields map[string]string) ([]byte, error) {
 	form := url.Values{}
 	for k, v := range fields {
 		form.Set(k, v)
 	}
-	req, err := http.NewRequest(http.MethodPost, reqURL, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("create urlencoded request: %w", err)
 	}
@@ -309,15 +371,7 @@ func (c *HttpClient) requestURLEncoded(reqURL string, fields map[string]string) 
 	if err != nil {
 		return nil, fmt.Errorf("send urlencoded request: %w", err)
 	}
-	defer resp.Body.Close()
-	respBody, readErr := readResponseBody(resp.Body)
-	if readErr != nil {
-		return nil, fmt.Errorf("read urlencoded response: %w", readErr)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return respBody, &HTTPStatusError{StatusCode: resp.StatusCode, Body: respBody}
-	}
-	return respBody, nil
+	return readHTTPResponse(resp, "urlencoded response")
 }
 
 func (c *HttpClient) decryptData(data string, out any) error {
@@ -331,8 +385,8 @@ func (c *HttpClient) decryptData(data string, out any) error {
 	return nil
 }
 
-func (c *HttpClient) startRequest(reqURL string, reqMethod string, reqBody any) (*apiResponse, error) {
-	respBytes, err := c.requestJSON(reqURL, reqMethod, reqBody)
+func (c *HttpClient) startRequest(ctx context.Context, reqURL string, reqMethod string, reqBody any) (*apiResponse, error) {
+	respBytes, err := c.requestJSON(ctx, reqURL, reqMethod, reqBody)
 	if err != nil {
 		if len(respBytes) == 0 {
 			return nil, err
@@ -355,12 +409,12 @@ func (c *HttpClient) startRequest(reqURL string, reqMethod string, reqBody any) 
 	return &respObj, nil
 }
 
-func (c *HttpClient) requestJSON(reqURL string, reqMethod string, reqBody any) ([]byte, error) {
+func (c *HttpClient) requestJSON(ctx context.Context, reqURL string, reqMethod string, reqBody any) ([]byte, error) {
 	reqBytes, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request body: %w", err)
 	}
-	req, err := http.NewRequest(reqMethod, reqURL, bytes.NewBuffer(reqBytes))
+	req, err := http.NewRequestWithContext(ctx, reqMethod, reqURL, bytes.NewBuffer(reqBytes))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -369,19 +423,16 @@ func (c *HttpClient) requestJSON(reqURL string, reqMethod string, reqBody any) (
 	if err != nil {
 		return nil, fmt.Errorf("send request: %w", err)
 	}
-	defer resp.Body.Close()
-	respBody, readErr := readResponseBody(resp.Body)
-	if readErr != nil {
-		return nil, fmt.Errorf("read response: %w", readErr)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return respBody, &HTTPStatusError{StatusCode: resp.StatusCode, Body: respBody}
-	}
-	return respBody, nil
+	return readHTTPResponse(resp, "response")
 }
 
 // RequestForm sends a multipart form request and returns its raw response body.
-func (c *HttpClient) RequestForm(reqURL string, fields map[string]string) (result []byte, callErr error) {
+func (c *HttpClient) RequestForm(reqURL string, fields map[string]string) ([]byte, error) {
+	return c.RequestFormContext(context.Background(), reqURL, fields)
+}
+
+// RequestFormContext is like RequestForm, with request cancellation and deadlines from ctx.
+func (c *HttpClient) RequestFormContext(ctx context.Context, reqURL string, fields map[string]string) (result []byte, callErr error) {
 	startedAt := time.Now()
 	defer func() {
 		if callErr != nil {
@@ -401,7 +452,7 @@ func (c *HttpClient) RequestForm(reqURL string, fields map[string]string) (resul
 	if err := writer.Close(); err != nil {
 		return nil, fmt.Errorf("close multipart writer: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, reqURL, body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("create form request: %w", err)
 	}
@@ -410,15 +461,23 @@ func (c *HttpClient) RequestForm(reqURL string, fields map[string]string) (resul
 	if err != nil {
 		return nil, fmt.Errorf("send form request: %w", err)
 	}
+	return readHTTPResponse(resp, "form response")
+}
+
+func readHTTPResponse(resp *http.Response, description string) ([]byte, error) {
 	defer resp.Body.Close()
-	respBody, readErr := readResponseBody(resp.Body)
-	if readErr != nil {
-		return nil, fmt.Errorf("read form response: %w", readErr)
-	}
+	body, readErr := readResponseBody(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return respBody, &HTTPStatusError{StatusCode: resp.StatusCode, Body: respBody}
+		statusErr := &HTTPStatusError{StatusCode: resp.StatusCode, Body: body}
+		if readErr != nil {
+			return nil, errors.Join(statusErr, fmt.Errorf("read %s: %w", description, readErr))
+		}
+		return body, statusErr
 	}
-	return respBody, nil
+	if readErr != nil {
+		return nil, fmt.Errorf("read %s: %w", description, readErr)
+	}
+	return body, nil
 }
 
 // readResponseBody 读取响应体，超过 maxResponseBytes 时返回错误，

@@ -129,6 +129,7 @@ type WsServer struct {
 	byteRate          int64
 	authenticator     Authenticator
 	onClientReady     ClientHook
+	onClientCommit    func(*Client) error
 	onClientClose     ClientHook
 }
 
@@ -201,6 +202,14 @@ func (s *WsServer) SetOnClientReady(fn ClientHook) {
 	s.onClientReady = fn
 }
 
+// SetOnClientReadyCommit configures the final step of publishing a ready connection.
+// It runs after the readiness callback and the session-order check, before replacing
+// the old connection. An error rejects the new connection. Configure it before Start.
+// It must only perform a quick publication step and must not call back into srv.
+func (s *WsServer) SetOnClientReadyCommit(fn func(*Client) error) {
+	s.onClientCommit = fn
+}
+
 // SetOnClientClose 注册连接关闭回调。回调在读取循环退出、连接已从索引移除后
 // 同步执行；此时连接 Context 已取消，但业务 Handler 可能仍在收尾，不要假设
 // 所有业务 goroutine 都已退出。
@@ -249,9 +258,12 @@ type Client struct {
 	codec        payloadcodec.Codec
 	authID       string
 	authSequence uint64
+	readyHandoff func(publish func()) error // guarded by readyMu
 
 	pending    map[string]chan *RPCMessage
 	pendingMu  sync.Mutex
+	sendCalls  sync.Map    // 帧首字节的地址 -> context.Context，仅用于反向 Call
+	readyMu    sync.Mutex  // serializes publishing this connection with beginning its close
 	closing    atomic.Bool // 确保只由一个协程关闭连接
 	sendMu     sync.RWMutex
 	sendClosed bool
@@ -284,6 +296,7 @@ func (m *ConnManager) unregister(client *Client) {
 	client.sendMu.Lock()
 	client.sendClosed = true
 	close(client.SendCh)
+	client.sendCalls.Clear()
 	client.sendMu.Unlock()
 	m.Lock.Unlock()
 	log.Info("连接断开, IP: %s:%d，剩余连接数: %d", client.IP, client.Port, count)
@@ -324,10 +337,14 @@ func (c *Client) Send(method string, arg any) error {
 	}
 }
 
+// Call sends a reverse RPC. The timeout budget includes time spent waiting to
+// enqueue the request and waiting for its response.
 func (c *Client) Call(method string, arg any, timeout time.Duration) (json.RawMessage, error) {
 	if c.closing.Load() {
 		return nil, errors.New("client connection closed")
 	}
+	ctx, cancel := context.WithTimeout(c.ctx, timeout)
+	defer cancel()
 	// 序列化参数
 	dataBytes, err := json.Marshal(arg)
 	if err != nil {
@@ -363,21 +380,9 @@ func (c *Client) Call(method string, arg any, timeout time.Duration) (json.RawMe
 		return nil, err
 	}
 
-	c.sendMu.RLock()
-	if c.sendClosed || c.closing.Load() {
-		c.sendMu.RUnlock()
-		return nil, errors.New("client connection closed")
+	if err := c.enqueueCall(ctx, b); err != nil {
+		return nil, err
 	}
-	select {
-	case c.SendCh <- b:
-	case <-c.ctx.Done():
-		c.sendMu.RUnlock()
-		return nil, errors.New("client connection closed")
-	case <-time.After(writeWait):
-		c.sendMu.RUnlock()
-		return nil, errors.New("send timeout")
-	}
-	c.sendMu.RUnlock()
 
 	// 等待响应或超时
 	select {
@@ -386,10 +391,48 @@ func (c *Client) Call(method string, arg any, timeout time.Duration) (json.RawMe
 			return nil, errors.New(rsp.Error)
 		}
 		return rsp.Data, nil
-	case <-time.After(timeout):
-		log.Error("rpc call timeout, data: %s", string(b))
-		return nil, errors.New("rpc timeout")
+	case <-ctx.Done():
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			log.Error("rpc call timeout, method: %s, session: %s", method, session)
+			return nil, errors.New("rpc timeout")
+		}
+		return nil, errors.New("connection lost")
 	}
+}
+
+func (c *Client) enqueueCall(ctx context.Context, frame []byte) error {
+	c.sendMu.RLock()
+	defer c.sendMu.RUnlock()
+	if c.sendClosed || c.closing.Load() {
+		return errors.New("client connection closed")
+	}
+	if ctx.Err() == nil {
+		// Retain the deadline after Call returns until the writer takes the frame.
+		c.sendCalls.Store(&frame[0], ctx)
+		select {
+		case c.SendCh <- frame:
+			return nil
+		case <-ctx.Done():
+			c.sendCalls.Delete(&frame[0])
+		}
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return errors.New("send timeout")
+	}
+	return errors.New("client connection closed")
+}
+
+func (c *Client) canWrite(frame []byte) bool {
+	if len(frame) == 0 {
+		return true
+	}
+	value, ok := c.sendCalls.LoadAndDelete(&frame[0])
+	if !ok {
+		return true
+	}
+	ctx := value.(context.Context)
+	deadline, _ := ctx.Deadline()
+	return ctx.Err() == nil && time.Now().Before(deadline)
 }
 
 func (c *Client) otherResponse(msg *RPCMessage) bool {
@@ -416,10 +459,16 @@ func (c *Client) meResponse(session string, data any, err error) {
 		log.Warn("meResponse: client already closed, drop response for session %s", session)
 		return
 	}
-	// 1. 先把业务结果转成字节
 	var dataBytes []byte
 	if data != nil {
-		dataBytes, _ = json.Marshal(data)
+		var marshalErr error
+		dataBytes, marshalErr = json.Marshal(data)
+		if marshalErr != nil {
+			log.Error("marshal rpc result failed: session=%s, err=%v", session, marshalErr)
+			if err == nil {
+				err = errors.New("encode response failed")
+			}
+		}
 	}
 
 	rsp := RPCMessage{
@@ -430,8 +479,16 @@ func (c *Client) meResponse(session string, data any, err error) {
 		rsp.Error = err.Error()
 	}
 	b, marshalErr := c.marshalRPCMessage(rsp)
-	if marshalErr != nil {
+	if marshalErr != nil && (len(rsp.Data) != 0 || rsp.Error == "") {
 		log.Error("marshal rpc response failed: session=%s, err=%v", session, marshalErr)
+		rsp.Data = nil
+		if rsp.Error == "" {
+			rsp.Error = "encode response failed"
+		}
+		b, marshalErr = c.marshalRPCMessage(rsp)
+	}
+	if marshalErr != nil {
+		log.Error("marshal rpc error response failed: session=%s, err=%v", session, marshalErr)
 		return
 	}
 	c.sendMu.RLock()
@@ -534,6 +591,9 @@ func (c *Client) writePump() {
 		case message, ok := <-c.SendCh:
 			if !ok || c.closing.Load() {
 				return
+			}
+			if !c.canWrite(message) {
+				continue
 			}
 			if err := c.writeText(message, writeWait); err != nil {
 				return
@@ -775,21 +835,29 @@ func (c *Client) authenticate(timeout time.Duration) error {
 		return fmt.Errorf("read auth message failed: %w", err)
 	}
 	if msgType != websocket.MessageText {
-		_ = c.sendAuthResponse(false, "auth failed: text message required")
+		_ = c.sendAuthResponse(ctx, false, "auth failed: text message required")
 		c.CloseWithReason(websocket.StatusPolicyViolation, "auth failed: text message required")
 		return errors.New("auth failed: text message required")
 	}
 
 	result, err := c.Server.authenticator(ctx, c, data)
+	deadline, _ := ctx.Deadline()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || !time.Now().Before(deadline) {
+		c.closeNow()
+		return errors.New("auth timeout")
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		log.Warn("认证失败: %v", err)
-		_ = c.sendAuthResponse(false, err.Error())
+		_ = c.sendAuthResponse(ctx, false, err.Error())
 		c.CloseWithReason(websocket.StatusPolicyViolation, "auth failed: "+err.Error())
 		return err
 	}
 	if result == nil || result.Type == "" || result.ID == "" {
 		err := errors.New("invalid auth result")
-		_ = c.sendAuthResponse(false, err.Error())
+		_ = c.sendAuthResponse(ctx, false, err.Error())
 		c.CloseWithReason(websocket.StatusPolicyViolation, "auth failed: invalid auth result")
 		return err
 	}
@@ -797,7 +865,7 @@ func (c *Client) authenticate(timeout time.Duration) error {
 	c.codec = result.Codec
 	c.beginSessionRegistration()
 
-	if err := c.sendAuthResponse(true, ""); err != nil {
+	if err := c.sendAuthResponse(ctx, true, ""); err != nil {
 		c.finishSessionRegistration()
 		return fmt.Errorf("send auth response failed: %w", err)
 	}
@@ -851,56 +919,116 @@ func (c *Client) finishSessionRegistration() {
 }
 
 func (c *Client) registerReady() bool {
+	toKick, ready, err := c.publishReady()
+	if err != nil {
+		log.Error("client ready commit failed: id=%s, err=%v", c.ID, err)
+		if !ready {
+			c.CloseWithReason(websocket.StatusInternalError, "client setup failed")
+			return false
+		}
+	}
+	if toKick != nil {
+		if toKick != c {
+			log.Warn("客户端ID %s 重新登录，新连接 %s:%d 将顶替旧连接 %s:%d",
+				c.ID, c.IP, c.Port, toKick.IP, toKick.Port)
+		}
+		go toKick.notifyKickedAndClose()
+	}
+	return ready
+}
+
+// SetReadyHandoff installs the connection's final publication step from the
+// ready callback. The step must call publish synchronously under its own
+// publication lock, or return an error before publishing to keep the old
+// connection. The step must return promptly and not call other srv methods.
+func (c *Client) SetReadyHandoff(handoff func(publish func()) error) {
+	c.readyMu.Lock()
+	defer c.readyMu.Unlock()
+	c.readyHandoff = handoff
+}
+
+func (c *Client) publishReady() (toKick *Client, ready bool, err error) {
 	s := c.Server
 	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	if s.stopping {
-		s.lifecycleMu.Unlock()
-		return false
+		return nil, false, nil
 	}
 	clientType, id := c.Type, c.ID
 
 	s.clientsMu.Lock()
+	defer s.clientsMu.Unlock()
+	c.readyMu.Lock()
+	defer c.readyMu.Unlock()
 	if c.closing.Load() {
-		s.clientsMu.Unlock()
-		s.lifecycleMu.Unlock()
-		return false
+		return nil, false, nil
 	}
 	order := s.sessionOrders[c.authID]
 	if c.authSequence < order.lastReady {
-		kick := c.closing.CompareAndSwap(false, true)
-		s.clientsMu.Unlock()
-		s.lifecycleMu.Unlock()
-		if kick {
-			// 过期连接也接收顶号通知，避免它自动重连再顶掉新会话。
-			go c.notifyKickedAndClose()
+		// 过期连接也接收顶号通知，避免它自动重连再顶掉新会话。
+		c.closing.Store(true)
+		return c, false, nil
+	}
+	if s.onClientCommit != nil {
+		if err := runReadyCommit(func() error { return s.onClientCommit(c) }); err != nil {
+			return nil, false, err
 		}
-		return false
 	}
-	order.lastReady = c.authSequence
-	oldClient := s.clientIDMap[id]
-	var kickOld bool
-	if oldClient != nil && oldClient != c {
-		s.removeFromTypePool(oldClient)
-		kickOld = oldClient.closing.CompareAndSwap(false, true)
+	publish := func() {
+		order.lastReady = c.authSequence
+		oldClient := s.clientIDMap[id]
+		if oldClient != nil && oldClient != c {
+			s.removeFromTypePool(oldClient)
+			if oldClient.beginClose() {
+				toKick = oldClient
+			}
+		}
+		if s.clientPool[clientType] == nil {
+			s.clientPool[clientType] = make(map[string]*Client)
+		}
+		s.clientPool[clientType][id] = c
+		s.clientIDMap[id] = c
+		ready = true
 	}
-	if s.clientPool[clientType] == nil {
-		s.clientPool[clientType] = make(map[string]*Client)
+	handoff := c.readyHandoff
+	c.readyHandoff = nil
+	if handoff == nil {
+		publish()
+		return toKick, ready, nil
 	}
-	s.clientPool[clientType][id] = c
-	s.clientIDMap[id] = c
-	s.clientsMu.Unlock()
-	s.lifecycleMu.Unlock()
 
-	if kickOld {
-		log.Warn("客户端ID %s 重新登录，新连接 %s:%d 将顶替旧连接 %s:%d",
-			id, c.IP, c.Port, oldClient.IP, oldClient.Port)
-		go oldClient.notifyKickedAndClose()
+	var publicationMu sync.Mutex
+	open := true
+	err = runReadyCommit(func() error {
+		return handoff(func() {
+			publicationMu.Lock()
+			defer publicationMu.Unlock()
+			if open {
+				open = false
+				publish()
+			}
+		})
+	})
+	publicationMu.Lock()
+	open = false
+	publicationMu.Unlock()
+	if !ready && err == nil {
+		err = errors.New("ready handoff did not publish")
 	}
-	return true
+	return toKick, ready, err
+}
+
+func runReadyCommit(commit func() error) (err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			err = fmt.Errorf("ready commit panic: %v", value)
+		}
+	}()
+	return commit()
 }
 
 // sendAuthResponse 向客户端发送认证结果。
-func (c *Client) sendAuthResponse(success bool, errMsg string) error {
+func (c *Client) sendAuthResponse(ctx context.Context, success bool, errMsg string) error {
 	if c.closing.Load() {
 		log.Error("sendAuthResponse: client already closed, cannot send auth response (success=%v, err=%s)", success, errMsg)
 		return errors.New("client connection closed")
@@ -918,7 +1046,9 @@ func (c *Client) sendAuthResponse(success bool, errMsg string) error {
 		return err
 	}
 
-	if err := c.writeText(b, 2*time.Second); err != nil {
+	writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := c.Conn.Write(writeCtx, websocket.MessageText, b); err != nil {
 		log.Warn("发送认证响应失败: %v", err)
 		return err
 	}
@@ -933,17 +1063,23 @@ func (c *Client) writeText(message []byte, timeout time.Duration) error {
 
 // CloseWithReason 用指定的状态码关闭连接。
 func (c *Client) CloseWithReason(code websocket.StatusCode, text string) {
-	if c.closing.CompareAndSwap(false, true) {
+	if c.beginClose() {
 		c.finishClose(code, text)
 	}
 }
 
 func (c *Client) closeNow() {
-	if c.closing.CompareAndSwap(false, true) {
+	if c.beginClose() {
 		defer close(c.closeDone)
 		defer c.cancel()
 		_ = c.Conn.CloseNow()
 	}
+}
+
+func (c *Client) beginClose() bool {
+	c.readyMu.Lock()
+	defer c.readyMu.Unlock()
+	return c.closing.CompareAndSwap(false, true)
 }
 
 func (c *Client) finishClose(code websocket.StatusCode, text string) {

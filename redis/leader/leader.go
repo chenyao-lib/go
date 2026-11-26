@@ -27,8 +27,8 @@
 // token 校验。
 //
 // Group 和 KeyPrefix 都相同的进程（不论实现语言）竞争同一个主节点位置；Owner
-// 必须唯一标识一个进程，重复会让两个进程反复互抢。TTL 默认 10 秒，
-// RenewInterval 和 RetryInterval 默认 TTL/3，续租间隔必须小于 TTL。
+// 必须唯一标识一个进程，重复会让两个进程反复互抢。TTL 默认 10 秒，最小 1 毫秒，
+// 向下取整到毫秒。RenewInterval 和 RetryInterval 默认取整后的 TTL/3，续租间隔必须小于取整后的 TTL。
 //
 // 消息热路径只用 IsLeader 做纯内存判断，不要每次都访问 Redis：
 //
@@ -58,8 +58,9 @@
 //
 // 进程退出前调用 Close：仍持有租约时会尽力释放，其它节点可以立即接管，不必等
 // TTL 过期。Resign 会主动让位并永久停止本次选举，需要重新参与选举必须重新 Open。
-// OnChange 可能在后台协程或调用 Resign/Close 的协程中执行，可能并发，回调必须
-// 自行同步；不要在回调里调用 Close（它会等待后台协程退出），需要让位时用 Resign。
+// OnChange 异步、串行地接收身份变化，可在回调里调用 Resign 或 Close。
+// 待派发的当选通知只有在任期仍有效时才执行。回调积压时，保留队首的降级
+// 通知和最近的变化，使回调仍能收尾已经开始的主节点任务。
 //
 // # 与其它语言互通
 //
@@ -138,6 +139,7 @@ const (
 	defaultKeyPrefix = "leader:"
 	defaultTTL       = 10 * time.Second
 	redisCallTimeout = 2 * time.Second
+	maxPendingEvents = 16
 )
 
 // Event.Reason 的取值。
@@ -214,13 +216,14 @@ type Config struct {
 	Group string
 	// Owner 必须唯一标识一个进程。
 	Owner string
-	// TTL 是租约时长，默认 10 秒。
+	// TTL 是租约时长，默认 10 秒，最小 1 毫秒，向下取整到毫秒。
 	TTL time.Duration
 	// RenewInterval 是当选后的续租间隔，默认 TTL/3，必须小于 TTL。
 	RenewInterval time.Duration
 	// RetryInterval 是未当选时的重试间隔，默认 TTL/3。
 	RetryInterval time.Duration
-	// OnChange 在主节点身份变化时调用。
+	// OnChange 按顺序异步、串行地调用。过期的当选通知会被跳过，积压时会合并旧通知。
+	// 回调可调用 Resign 或 Close，已经派发的回调可在关闭后完成。
 	OnChange func(Event)
 }
 
@@ -248,16 +251,22 @@ type Election struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	closeOnce sync.Once
+	closeErr  error
 	closed    atomic.Bool
+
+	eventMu     sync.Mutex
+	events      []Event
+	dispatching bool
 
 	leader atomic.Bool
 	epoch  atomic.Int64
 
 	// opMu 串行化续租与主动让位，避免让位删除租约后，正在执行的续租又把它写回去。
 	opMu sync.Mutex
-	// leaseTillNano 是本地租约到期的 UnixNano，0 表示没有租约。
-	// IsLeader 会在热路径上校验它，续租调用卡住时到期也不会继续返回 true。
-	leaseTillNano atomic.Int64
+	// mayOwnLease tracks acquisitions whose Redis result was successful or unknown. Guarded by opMu.
+	mayOwnLease bool
+	// leaseTill 保留单调时钟读数，nil 表示没有本地租约。
+	leaseTill atomic.Pointer[time.Time]
 }
 
 // Open 创建选举并启动后台抢占/续租协程。
@@ -284,6 +293,10 @@ func Open(ctx context.Context, cfg Config) (*Election, error) {
 	if cfg.TTL <= 0 {
 		cfg.TTL = defaultTTL
 	}
+	cfg.TTL = cfg.TTL.Truncate(time.Millisecond)
+	if cfg.TTL == 0 {
+		return nil, errors.New("leader ttl must be at least 1ms")
+	}
 	if cfg.RenewInterval <= 0 {
 		cfg.RenewInterval = cfg.TTL / 3
 	}
@@ -296,13 +309,14 @@ func Open(ctx context.Context, cfg Config) (*Election, error) {
 	cfg.KeyPrefix = normalizeKeyPrefix(cfg.KeyPrefix)
 
 	client := redis.NewClient(&redis.Options{
-		Addr:         cfg.Addr,
-		Password:     cfg.Password,
-		DB:           cfg.DB,
-		DialTimeout:  3 * time.Second,
-		ReadTimeout:  redisCallTimeout,
-		WriteTimeout: redisCallTimeout,
-		PoolSize:     10,
+		Addr:                  cfg.Addr,
+		Password:              cfg.Password,
+		DB:                    cfg.DB,
+		DialTimeout:           3 * time.Second,
+		ReadTimeout:           redisCallTimeout,
+		WriteTimeout:          redisCallTimeout,
+		PoolSize:              10,
+		ContextTimeoutEnabled: true,
 	})
 	if err := client.Ping(ctx).Err(); err != nil {
 		_ = client.Close()
@@ -345,7 +359,7 @@ func Open(ctx context.Context, cfg Config) (*Election, error) {
 // 本地租约到期后即使续租调用还没返回也返回 false，不会因为 Redis 卡住而多当
 // 一段时间的主节点。
 func (e *Election) IsLeader() bool {
-	return e != nil && e.leader.Load() && !e.leaseExpired()
+	return e != nil && e.leader.Load() && !e.leaseExpired() && !e.closed.Load()
 }
 
 // Epoch 返回当前任期的 fencing token（毫秒量级），非主节点返回 0。
@@ -369,6 +383,13 @@ func (e *Election) Leader(ctx context.Context) (string, int64, error) {
 	defer cancel()
 
 	values, err := e.client.HMGet(callCtx, e.ownerKey(), "owner", "epoch").Result()
+	if ctxErr := callCtx.Err(); ctxErr != nil {
+		return "", 0, ctxErr
+	}
+	// The socket deadline may fire before the context's timer callback runs.
+	if deadline, ok := callCtx.Deadline(); ok && !time.Now().Before(deadline) {
+		return "", 0, context.DeadlineExceeded
+	}
 	if err != nil {
 		return "", 0, err
 	}
@@ -383,7 +404,7 @@ func (e *Election) Leader(ctx context.Context) (string, int64, error) {
 }
 
 // Resign 主动释放租约并永久停止本次选举：之后 IsLeader 恒为 false，不再抢占。
-// 需要重新参与选举必须再次调用 Open。释放失败只记录日志，本地状态照样降级。
+// 本地先降级，再释放 Redis 租约。需要重新参与选举必须再次调用 Open。
 func (e *Election) Resign(ctx context.Context) error {
 	if e == nil {
 		return nil
@@ -400,10 +421,14 @@ func (e *Election) Resign(ctx context.Context) error {
 		return ErrClosed
 	}
 	e.cancel()
+	event := e.demote(ReasonResigned, 0, "")
+	if event != nil {
+		e.emit(*event)
+	}
 	releaseCtx, releaseCancel := withRedisTimeout(context.WithoutCancel(ctx))
 	released, err := e.release(releaseCtx)
 	releaseCancel()
-	event := e.demote(ReasonResigned, 0, "")
+	e.mayOwnLease = err != nil && (e.mayOwnLease || event != nil)
 	e.opMu.Unlock()
 
 	if err != nil {
@@ -411,18 +436,15 @@ func (e *Election) Resign(ctx context.Context) error {
 	} else if !released {
 		log.Warn("主动让位时已不是租约持有者: group=%s, owner=%s", e.group, e.owner)
 	}
-	if event != nil {
-		e.emit(*event)
-	}
 	return err
 }
 
-// Close 停止选举并在仍持有租约时尽力释放，让其它节点立即接管。
+// Close 停止选举并尝试释放本次选举可能持有的租约，让其它节点接管。
+// 并发或重复调用共享首次关闭的结果。
 func (e *Election) Close() error {
 	if e == nil {
 		return nil
 	}
-	var closeErr error
 	e.closeOnce.Do(func() {
 		e.closed.Store(true)
 		e.cancel()
@@ -430,26 +452,27 @@ func (e *Election) Close() error {
 
 		e.opMu.Lock()
 		event := e.demote(ReasonClosed, 0, "")
-		e.opMu.Unlock()
-
 		if event != nil {
+			e.emit(*event)
+		}
+		if event != nil || e.mayOwnLease {
 			releaseCtx, cancel := withRedisTimeout(context.Background())
 			released, err := e.release(releaseCtx)
 			cancel()
 			if err != nil {
 				log.Error("关闭时释放主节点租约失败: group=%s, owner=%s, err=%v", e.group, e.owner, err)
-				closeErr = err
+				e.closeErr = err
 			} else if !released {
 				log.Warn("关闭时已不是租约持有者: group=%s, owner=%s", e.group, e.owner)
 			}
-			e.emit(*event)
 		}
+		e.opMu.Unlock()
 		log.Info("主节点选举关闭: group=%s, owner=%s", e.group, e.owner)
-		if err := e.client.Close(); err != nil && closeErr == nil {
-			closeErr = err
+		if err := e.client.Close(); err != nil && e.closeErr == nil {
+			e.closeErr = err
 		}
 	})
-	return closeErr
+	return e.closeErr
 }
 
 func (e *Election) run() {
@@ -464,10 +487,12 @@ func (e *Election) run() {
 		case <-timer.C:
 		}
 
+		e.opMu.Lock()
 		wait, event := e.step()
 		if event != nil {
 			e.emit(*event)
 		}
+		e.opMu.Unlock()
 		if e.ctx.Err() != nil {
 			return
 		}
@@ -475,11 +500,8 @@ func (e *Election) run() {
 	}
 }
 
-// step 执行一次抢占或续租，返回下一轮的等待时间和需要通知的身份变化。
+// step 执行一次抢占或续租，调用方持有 opMu。
 func (e *Election) step() (time.Duration, *Event) {
-	e.opMu.Lock()
-	defer e.opMu.Unlock()
-
 	if e.closed.Load() || e.ctx.Err() != nil {
 		return e.ttl, nil
 	}
@@ -487,6 +509,7 @@ func (e *Election) step() (time.Duration, *Event) {
 	ctx, cancel := withRedisTimeout(e.ctx)
 	acquired, epoch, holder, err := e.acquire(ctx)
 	cancel()
+	e.mayOwnLease = acquired || err != nil
 
 	if err != nil {
 		if e.ctx.Err() != nil {
@@ -504,15 +527,21 @@ func (e *Election) step() (time.Duration, *Event) {
 	}
 
 	if acquired {
-		wasLeader := e.leader.Swap(true)
-		e.epoch.Store(epoch)
 		// 用请求发起时间计算本地租约，保证本地到期不晚于 Redis 侧到期，
 		// Redis 不可用时不会比真实租约多当一小段时间的主节点。
-		e.setLeaseTill(start.Add(e.ttl))
-		if e.leaseExpired() {
-			// 续租往返时间已经超过租期，Redis 侧租约同样已经过期，不能继续当主节点。
+		deadline := start.Add(e.ttl)
+		if !time.Now().Before(deadline) {
 			return e.retryInterval, e.demote(ReasonLeaseExpired, 0, "")
 		}
+		if e.leader.Load() && (e.epoch.Load() != epoch || e.leaseExpired()) {
+			if event := e.demote(ReasonLeaseExpired, 0, ""); event != nil {
+				e.emit(*event)
+			}
+		}
+		wasLeader := e.leader.Load()
+		e.epoch.Store(epoch)
+		e.setLeaseTill(deadline)
+		e.leader.Store(true)
 		if !wasLeader {
 			log.Info("当选主节点: group=%s, owner=%s, epoch=%d", e.group, e.owner, epoch)
 			return e.renewInterval, &Event{IsLeader: true, Epoch: epoch, Reason: ReasonAcquired, Holder: e.owner}
@@ -582,22 +611,69 @@ func (e *Election) demote(reason string, epoch int64, holder string) *Event {
 }
 
 func (e *Election) emit(event Event) {
-	if e.onChange != nil {
-		e.onChange(event)
+	if e.onChange == nil {
+		return
 	}
+	e.eventMu.Lock()
+	defer e.eventMu.Unlock()
+	if len(e.events) == maxPendingEvents {
+		drop := 0
+		if !e.events[0].IsLeader {
+			// The first loss may need to stop work started by the current callback.
+			drop = 1
+		}
+		copy(e.events[drop:], e.events[drop+1:])
+		e.events = e.events[:len(e.events)-1]
+	}
+	e.events = append(e.events, event)
+	if !e.dispatching {
+		e.dispatching = true
+		go e.dispatchEvents()
+	}
+}
+
+func (e *Election) dispatchEvents() {
+	for {
+		e.eventMu.Lock()
+		if len(e.events) == 0 {
+			e.events = nil
+			e.dispatching = false
+			e.eventMu.Unlock()
+			return
+		}
+		event := e.events[0]
+		e.events[0] = Event{}
+		e.events = e.events[1:]
+		e.eventMu.Unlock()
+
+		if event.IsLeader && (e.ctx.Err() != nil || e.Epoch() != event.Epoch) {
+			continue
+		}
+		e.notifyChange(event)
+	}
+}
+
+func (e *Election) notifyChange(event Event) {
+	defer func() {
+		if value := recover(); value != nil {
+			log.Error("OnChange 回调 panic: group=%s, owner=%s, reason=%s, epoch=%d, panic=%v",
+				e.group, e.owner, event.Reason, event.Epoch, value)
+		}
+	}()
+	e.onChange(event)
 }
 
 func (e *Election) setLeaseTill(t time.Time) {
 	if t.IsZero() {
-		e.leaseTillNano.Store(0)
+		e.leaseTill.Store(nil)
 		return
 	}
-	e.leaseTillNano.Store(t.UnixNano())
+	e.leaseTill.Store(&t)
 }
 
 func (e *Election) leaseExpired() bool {
-	deadline := e.leaseTillNano.Load()
-	return deadline == 0 || time.Now().UnixNano() >= deadline
+	deadline := e.leaseTill.Load()
+	return deadline == nil || !time.Now().Before(*deadline)
 }
 
 func (e *Election) ownerKey() string {

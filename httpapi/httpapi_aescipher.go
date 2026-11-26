@@ -97,7 +97,8 @@ func (e *AESCipher) key() ([]byte, error) {
 
 func pkcs7Pad(data []byte, blockSize int) []byte {
 	padding := blockSize - len(data)%blockSize
-	return append(data, bytes.Repeat([]byte{byte(padding)}, padding)...)
+	// Appending the padding must not write to the caller's backing buffer.
+	return append(data[:len(data):len(data)], bytes.Repeat([]byte{byte(padding)}, padding)...)
 }
 
 func pkcs7Unpad(data []byte, blockSize int) ([]byte, error) {

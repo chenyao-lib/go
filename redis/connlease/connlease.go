@@ -16,8 +16,8 @@
 //	defer manager.Close()
 //
 // ServerAddr 必须能唯一标识当前服务节点。KeyPrefix 为空时使用 session:；
-// SessionTTL 和 RenewInterval 未设置时分别为 30 秒和 10 秒，且续租间隔必须
-// 小于租约 TTL。运行状态统一通过 github.com/chenyao-lib/go/log 输出。
+// SessionTTL 和 RenewInterval 未设置时分别为 30 秒和 10 秒。TTL 至少为 1 毫秒，
+// 向下取整到毫秒，续租间隔必须小于取整后的 TTL。运行状态通过 github.com/chenyao-lib/go/log 输出。
 //
 // # 注册连接
 //
@@ -49,6 +49,7 @@
 // 底层连接关闭时必须调用 Unregister；释放脚本会比较 connection ID，旧连接
 // 不会误删新连接的 owner。Handle.Epoch 是单调递增 fencing token，若后端写入
 // 也必须拒绝旧连接，可把 epoch 一并写入下游存储并仅接受更新值。
+// Redis 为每个出现过的 session key 持久保留一个 epoch 计数键，以跨空闲期递增。
 //
 // Manager.Close 会停止订阅与续租，并尽力释放本进程仍持有的 owner。关闭后
 // Register 返回 ErrManagerClosed；Validate 对已失效句柄返回 ErrOwnershipLost。
@@ -77,10 +78,8 @@ const (
 	defaultSessionTTL    = 30 * time.Second
 	defaultRenewInterval = 10 * time.Second
 	redisCallTimeout     = 2 * time.Second
-	// epochKeyTTLFactor 控制 epoch key 的过期时间倍数。
-	// epoch key 只增不减会永久占用内存，这里按 session TTL 的 30 倍过期：
-	// 远大于任何正常会话存活时间，又能让空闲 key 最终被 Redis 回收。
-	epochKeyTTLFactor = 30
+	ownerWorkers         = 8
+	closeReleaseTimeout  = 5 * time.Second
 	// maxRenewFailures 是续租连续失败阈值。
 	// Redis 短暂抖动时单次失败不代表所有权丢失，连续多次失败才关闭连接，
 	// 避免网络瞬断把所有在线连接全部踢掉。
@@ -94,45 +93,51 @@ var (
 	ErrManagerClosed = errors.New("session manager is closed")
 )
 
-// acquireScript 在一个 Redis 原子操作中替换 owner、递增 fencing epoch 并刷新租约。
-// 返回旧 owner 是为了让新连接能够通过 PubSub 精确踢掉旧 connection_id。
-// epoch key 与 renewScript 对称：缺失时先从 owner hash 恢复再递增。
-// 否则 epoch key 被驱逐或丢失后 INCR 会从 0 重新开始，fencing token 回退，
-// 下游按 epoch 拒绝旧写入的保护会静默失效。
-var acquireScript = redis.NewScript(`
-local old_server = redis.call("HGET", KEYS[1], "server_addr") or ""
-local old_connection = redis.call("HGET", KEYS[1], "connection_id") or ""
-if redis.call("EXISTS", KEYS[2]) == 0 then
+// Redis stores epochs as canonical decimal strings. Lua numbers cannot compare all int64 epochs exactly.
+const restoreEpochFloorLua = `
+local function is_epoch(value)
+	return value == "0" or string.match(value, "^[1-9][0-9]*$")
+end
+
+local function restore_epoch_floor()
 	local epoch = redis.call("HGET", KEYS[1], "epoch")
-	if epoch then
+	if not epoch then
+		return
+	end
+	local counter = redis.call("GET", KEYS[2])
+	if not is_epoch(epoch) or (counter and not is_epoch(counter)) then
+		error("invalid fencing epoch")
+	end
+	if not counter or #counter < #epoch or (#counter == #epoch and counter < epoch) then
 		redis.call("SET", KEYS[2], epoch)
 	end
 end
-local epoch = redis.call("INCR", KEYS[2])
+`
+
+// acquireScript 原子替换 owner、递增 fencing epoch 并刷新租约。
+// 返回旧 owner 以便精确踢掉旧 connection_id。PERSIST 清除旧版本留下的 TTL。
+var acquireScript = redis.NewScript(restoreEpochFloorLua + `
+local old_server = redis.call("HGET", KEYS[1], "server_addr") or ""
+local old_connection = redis.call("HGET", KEYS[1], "connection_id") or ""
+restore_epoch_floor()
+redis.call("INCR", KEYS[2])
+redis.call("PERSIST", KEYS[2])
+local epoch = redis.call("GET", KEYS[2])
 redis.call("HSET", KEYS[1],
 	"server_addr", ARGV[1],
 	"connection_id", ARGV[2],
 	"epoch", epoch)
 redis.call("PEXPIRE", KEYS[1], ARGV[3])
-redis.call("PEXPIRE", KEYS[2], ARGV[4])
-return {old_server, old_connection, tostring(epoch)}
+return {old_server, old_connection, epoch}
 `)
 
 // renewScript 只允许当前 connection_id 续租，旧连接不能延长新连接的租约。
-// 同时刷新 epoch key 的过期时间：epoch 只在 acquire 时递增，若仅在 acquire
-// 续 TTL，长连接存活超过 epoch TTL 后 key 过期，下一次 INCR 会从 0 重新开始，
-// fencing token 回退。epoch key 意外缺失时从 owner hash 中恢复当前值，保证
-// 同一 owner 生命周期内 epoch 单调不减。
-var renewScript = redis.NewScript(`
+// 保活用当前 owner 的任期校正计数器下限，并清除旧版本留下的 epoch TTL。
+var renewScript = redis.NewScript(restoreEpochFloorLua + `
 if redis.call("HGET", KEYS[1], "connection_id") == ARGV[1] then
-	if redis.call("EXISTS", KEYS[2]) == 0 then
-		local epoch = redis.call("HGET", KEYS[1], "epoch")
-		if epoch then
-			redis.call("SET", KEYS[2], epoch)
-		end
-	end
+	restore_epoch_floor()
 	redis.call("PEXPIRE", KEYS[1], ARGV[2])
-	redis.call("PEXPIRE", KEYS[2], ARGV[3])
+	redis.call("PERSIST", KEYS[2])
 	return 1
 end
 return 0
@@ -169,11 +174,21 @@ type Manager struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	closeOnce sync.Once
+	closeErr  error
 	wg        sync.WaitGroup
+
+	admissionMu sync.Mutex
+	ownerOps    sync.WaitGroup // Close 等已接收的注册和注销完成后再接管清理
 
 	mu             sync.RWMutex
 	byConnectionID map[string]*Handle
 }
+
+const (
+	leasePending = iota
+	leaseActive
+	leaseInactive
+)
 
 // Handle 表示已向 Manager 注册的一条连接。调用方应保存该句柄，并在消息处理前
 // 调用 Validate，在底层连接关闭时调用 Unregister。
@@ -183,16 +198,13 @@ type Handle struct {
 	connectionID string
 	epoch        int64
 	close        func(reason string)
-	// active 是消息热路径的本地判断依据，避免每条消息访问 Redis。
-	// PubSub 踢出或续租失败时必须先置为 false，再关闭底层连接。
-	active atomic.Bool
+	// state prevents a queued kick from being overwritten by a delayed acquire reply.
+	state atomic.Int32
+	// 使用本地单调时钟，续租未得到确认时也能按时停止放行。
+	validUntil atomic.Pointer[time.Time]
 	// renewFailures 记录连续续租失败次数，成功一次即清零。
 	// 只有达到阈值才关闭连接，避免 Redis 瞬时抖动导致全量踢线。
 	renewFailures atomic.Int32
-	// released 表示调用方已通过 Unregister 主动注销。
-	// 续租快照可能滞后于 Unregister，没有它会对正在正常关闭的连接再回调一次 closeFn。
-	released  atomic.Bool
-	closeOnce sync.Once
 }
 
 // Key 返回注册该连接时使用的会话 key。
@@ -219,9 +231,13 @@ func (h *Handle) Epoch() int64 {
 	return h.epoch
 }
 
-// Active 返回该句柄当前是否仍持有本地有效状态。
+// Active 返回该句柄是否仍有效且本地租约尚未到期。
 func (h *Handle) Active() bool {
-	return h != nil && h.active.Load()
+	if h == nil || h.state.Load() != leaseActive {
+		return false
+	}
+	until := h.validUntil.Load()
+	return until != nil && time.Now().Before(*until)
 }
 
 type kickMessage struct {
@@ -247,6 +263,10 @@ func Open(ctx context.Context, cfg Config) (*Manager, error) {
 	if cfg.SessionTTL <= 0 {
 		cfg.SessionTTL = defaultSessionTTL
 	}
+	cfg.SessionTTL = cfg.SessionTTL.Truncate(time.Millisecond)
+	if cfg.SessionTTL == 0 {
+		return nil, errors.New("session ttl must be at least 1ms")
+	}
 	if cfg.RenewInterval <= 0 {
 		cfg.RenewInterval = defaultRenewInterval
 	}
@@ -256,13 +276,14 @@ func Open(ctx context.Context, cfg Config) (*Manager, error) {
 	cfg.KeyPrefix = normalizeKeyPrefix(cfg.KeyPrefix)
 
 	client := redis.NewClient(&redis.Options{
-		Addr:         cfg.Addr,
-		Password:     cfg.Password,
-		DB:           cfg.DB,
-		DialTimeout:  3 * time.Second,
-		ReadTimeout:  redisCallTimeout,
-		WriteTimeout: redisCallTimeout,
-		PoolSize:     10,
+		Addr:                  cfg.Addr,
+		Password:              cfg.Password,
+		DB:                    cfg.DB,
+		DialTimeout:           3 * time.Second,
+		ReadTimeout:           redisCallTimeout,
+		WriteTimeout:          redisCallTimeout,
+		PoolSize:              10,
+		ContextTimeoutEnabled: true,
 	})
 	if err := client.Ping(ctx).Err(); err != nil {
 		_ = client.Close()
@@ -307,8 +328,9 @@ func Open(ctx context.Context, cfg Config) (*Manager, error) {
 	return manager, nil
 }
 
-// Register 原子抢占指定 key 的 owner；抢占成功后通知旧 connection_id 下线。
-// closeFn 会在所有权丢失或续租失败时被调用，并且对每个 Handle 最多调用一次。
+// Register 原子抢占指定 key 的 owner。确认抢占成功后，用独立的 Redis 超时通知旧 connection_id 下线。
+// closeFn 会在所有权丢失或续租失败时异步调用，每个 Handle 最多调用一次。
+// 回调可调用 Close；Close 不等待回调执行完成。
 func (m *Manager) Register(
 	ctx context.Context,
 	key string,
@@ -321,35 +343,47 @@ func (m *Manager) Register(
 	if closeFn == nil {
 		return nil, errors.New("session close callback is nil")
 	}
-	select {
-	case <-m.ctx.Done():
+	if !m.beginOwnerOp() {
 		return nil, ErrManagerClosed
-	default:
 	}
+	defer m.ownerOps.Done()
 
 	connectionID, err := newConnectionID()
 	if err != nil {
 		return nil, fmt.Errorf("generate connection id: %w", err)
 	}
-	previous, epoch, err := m.acquire(ctx, key, connectionID)
-	if err != nil {
-		log.Error("获取连接所有权失败: key=%s, server=%s, err=%v", key, m.serverAddr, err)
-		return nil, err
-	}
-
-	entry := &Handle{
-		manager:      m,
-		key:          key,
-		connectionID: connectionID,
-		epoch:        epoch,
-		close:        closeFn,
-	}
-	entry.active.Store(true)
+	// Reserve the ID before Redis can publish an ownership change for it.
+	entry := &Handle{manager: m, key: key, connectionID: connectionID, close: closeFn}
 	m.mu.Lock()
 	m.byConnectionID[connectionID] = entry
 	m.mu.Unlock()
 
+	started := time.Now()
+	previous, epoch, err := m.acquire(ctx, key, connectionID)
+	if err != nil {
+		m.removeConnection(entry)
+		// Redis may have applied the script before the response timed out.
+		// Use an independent deadline and only delete an owner from this attempt.
+		if _, releaseErr := m.releaseOwner(context.Background(), key, connectionID); releaseErr != nil {
+			log.Warn("清理未确认的连接租约失败: key=%s, connection=%s, err=%v", key, connectionID, releaseErr)
+		}
+		if m.ctx.Err() != nil {
+			return nil, ErrManagerClosed
+		}
+		log.Error("获取连接所有权失败: key=%s, server=%s, err=%v", key, m.serverAddr, err)
+		return nil, err
+	}
+
+	entry.epoch = epoch
+	until := started.Add(m.sessionTTL)
+	entry.validUntil.Store(&until)
+
+	// Once Redis confirms the handoff, the previous owner has been replaced
+	// even if the caller's request expires or this manager starts closing.
 	if previous.connectionID != "" && previous.connectionID != connectionID {
+		if old := m.connectionByID(previous.connectionID); old != nil && old.key == key {
+			m.closeConnection(old, "connection replaced", nil)
+		}
 		log.Warn(
 			"新连接替换旧连接: key=%s, old_server=%s, old_connection=%s, new_server=%s, new_connection=%s",
 			key,
@@ -368,6 +402,13 @@ func (m *Manager) Register(
 			)
 		}
 	}
+	if m.ctx.Err() != nil {
+		return nil, ErrManagerClosed // Close will release the indexed lease.
+	}
+	if !time.Now().Before(until) || !entry.state.CompareAndSwap(leasePending, leaseActive) {
+		m.Unregister(ctx, entry)
+		return nil, ErrOwnershipLost
+	}
 	log.Info(
 		"已获取连接所有权: key=%s, server=%s, connection=%s, epoch=%d",
 		key,
@@ -375,22 +416,34 @@ func (m *Manager) Register(
 		connectionID,
 		epoch,
 	)
+	if m.ctx.Err() != nil {
+		return nil, ErrManagerClosed
+	}
+	if !entry.Active() {
+		m.Unregister(ctx, entry)
+		return nil, ErrOwnershipLost
+	}
 	return entry, nil
+}
+
+func (m *Manager) beginOwnerOp() bool {
+	m.admissionMu.Lock()
+	defer m.admissionMu.Unlock()
+	if m.ctx.Err() != nil {
+		return false
+	}
+	m.ownerOps.Add(1)
+	return true
 }
 
 // Unregister 先从本地索引移除连接，再按 connection_id 条件释放 Redis owner。
 func (m *Manager) Unregister(ctx context.Context, handle *Handle) {
+	if handle == nil || handle.manager != m || !m.beginOwnerOp() {
+		return // 关闭期间保留索引，由 Close 统一释放
+	}
+	defer m.ownerOps.Done()
 	entry := m.removeConnection(handle)
 	if entry == nil {
-		return
-	}
-	entry.active.Store(false)
-	if m.ctx.Err() != nil {
-		log.Debug(
-			"管理器已关闭，仅移除本地连接: key=%s, connection=%s",
-			entry.key,
-			entry.connectionID,
-		)
 		return
 	}
 	// 释放属于关闭清理，不能因为调用方 ctx 已取消（连接关闭路径上很常见）
@@ -398,14 +451,7 @@ func (m *Manager) Unregister(ctx context.Context, handle *Handle) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	releaseCtx, cancel := withRedisTimeout(context.WithoutCancel(ctx))
-	defer cancel()
-	released, err := releaseScript.Run(
-		releaseCtx,
-		m.client,
-		[]string{m.ownerKey(entry.key)},
-		entry.connectionID,
-	).Int()
+	released, err := m.releaseOwner(context.WithoutCancel(ctx), entry.key, entry.connectionID)
 	if err != nil && !errors.Is(err, redis.Nil) {
 		log.Error(
 			"释放连接所有权失败: key=%s, connection=%s, err=%v",
@@ -430,10 +476,10 @@ func (m *Manager) Unregister(ctx context.Context, handle *Handle) {
 	}
 }
 
-// Validate 只读取本地 active，不在消息热路径访问 Redis。
+// Validate 检查本地有效状态和租约到期时间，不在消息热路径访问 Redis。
 // 全局 owner 的变化由 PubSub 快速通知，并由定时续租作为漏消息后的兜底检测。
 func (m *Manager) Validate(handle *Handle) error {
-	if handle == nil || handle.manager != m || !handle.active.Load() {
+	if handle == nil || handle.manager != m || !handle.Active() || m.ctx.Err() != nil {
 		return ErrOwnershipLost
 	}
 	if current := m.connectionByID(handle.connectionID); current != handle {
@@ -442,61 +488,101 @@ func (m *Manager) Validate(handle *Handle) error {
 	return nil
 }
 
-// Close 停止后台协程，并尽力释放仍由本进程持有的 owner。
+// Close 停止后台协程，并用共同的 5 秒期限并行释放仍由本进程持有的 owner。
+// 未成功释放的租约由 Redis 按 TTL 过期。
 func (m *Manager) Close() error {
-	var closeErr error
 	m.closeOnce.Do(func() {
+		m.admissionMu.Lock()
+		m.cancel()
+		m.admissionMu.Unlock()
+		m.ownerOps.Wait()
+
 		entries := m.connectionSnapshot()
 		log.Info(
 			"正在关闭管理器: server=%s, active_connections=%d",
 			m.serverAddr,
 			len(entries),
 		)
-		m.cancel()
 		// 与 resubscribeKicks 的替换互斥：这里取走并清空，避免关掉刚换上的新订阅。
 		if ps := m.swapPubSub(nil); ps != nil {
 			if err := ps.Close(); err != nil {
 				log.Warn("关闭踢线订阅失败: err=%v", err)
-				closeErr = err
+				m.closeErr = err
 			}
 		}
 		m.wg.Wait()
 
 		for _, entry := range entries {
-			entry.active.Store(false)
-			ctx, cancel := context.WithTimeout(context.Background(), redisCallTimeout)
-			err := releaseScript.Run(
-				ctx,
-				m.client,
-				[]string{m.ownerKey(entry.key)},
-				entry.connectionID,
-			).Err()
-			cancel()
-			if err != nil && !errors.Is(err, redis.Nil) {
-				log.Error(
-					"关闭时释放连接所有权失败: key=%s, connection=%s, err=%v",
-					entry.key,
-					entry.connectionID,
-					err,
-				)
-				if closeErr == nil {
-					closeErr = err
-				}
-			}
+			m.removeConnection(entry)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), closeReleaseTimeout)
+		err := m.releaseConnections(ctx, entries)
+		cancel()
+		if err != nil && m.closeErr == nil {
+			m.closeErr = err
 		}
 		if err := m.client.Close(); err != nil {
 			log.Warn("关闭 Redis 客户端失败: err=%v", err)
-			if closeErr == nil {
-				closeErr = err
+			if m.closeErr == nil {
+				m.closeErr = err
 			}
 		}
-		if closeErr != nil {
-			log.Warn("管理器关闭完成但存在错误: server=%s, err=%v", m.serverAddr, closeErr)
+		if m.closeErr != nil {
+			log.Warn("管理器关闭完成但存在错误: server=%s, err=%v", m.serverAddr, m.closeErr)
 		} else {
 			log.Info("管理器已关闭: server=%s", m.serverAddr)
 		}
 	})
-	return closeErr
+	return m.closeErr
+}
+
+func (m *Manager) releaseConnections(ctx context.Context, entries []*Handle) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	var firstErr error
+	var firstFailure sync.Once
+	forEachConnection(ctx, entries, func(ctx context.Context, entry *Handle) {
+		_, err := m.releaseOwner(ctx, entry.key, entry.connectionID)
+		if err != nil && !errors.Is(err, redis.Nil) {
+			log.Error("关闭时释放连接所有权失败: key=%s, connection=%s, err=%v", entry.key, entry.connectionID, err)
+			firstFailure.Do(func() { firstErr = err })
+		}
+	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return firstErr
+}
+
+func forEachConnection(ctx context.Context, entries []*Handle, work func(context.Context, *Handle)) {
+	jobs := make(chan *Handle)
+	var workers sync.WaitGroup
+	for range min(ownerWorkers, len(entries)) {
+		workers.Go(func() {
+			for entry := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				work(ctx, entry)
+			}
+		})
+	}
+	defer workers.Wait()
+	defer close(jobs)
+	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return
+		case jobs <- entry:
+		}
+	}
+}
+
+func (m *Manager) releaseOwner(ctx context.Context, key, connectionID string) (int, error) {
+	releaseCtx, cancel := withRedisTimeout(ctx)
+	defer cancel()
+	return releaseScript.Run(releaseCtx, m.client, []string{m.ownerKey(key)}, connectionID).Int()
 }
 
 func (m *Manager) acquire(
@@ -513,7 +599,6 @@ func (m *Manager) acquire(
 		m.serverAddr,
 		connectionID,
 		m.sessionTTL.Milliseconds(),
-		m.sessionTTL.Milliseconds()*epochKeyTTLFactor,
 	).Slice()
 	if err != nil {
 		return previousOwner{}, 0, fmt.Errorf("acquire connection ownership: %w", err)
@@ -536,7 +621,10 @@ func (m *Manager) publishKick(ctx context.Context, key, connectionID string) err
 	if err != nil {
 		return err
 	}
-	publishCtx, cancel := withRedisTimeout(ctx)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	publishCtx, cancel := withRedisTimeout(context.WithoutCancel(ctx))
 	defer cancel()
 	return m.client.Publish(publishCtx, m.kickChannel(), data).Err()
 }
@@ -643,73 +731,76 @@ func (m *Manager) renewConnections() {
 		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
-			for _, entry := range m.connectionSnapshot() {
-				// 快照可能包含本轮 tick 之前已被 Unregister 的连接，跳过。
-				if m.connectionByID(entry.connectionID) != entry {
-					continue
-				}
-				ctx, cancel := context.WithTimeout(m.ctx, redisCallTimeout)
-				renewed, err := renewScript.Run(
-					ctx,
-					m.client,
-					[]string{m.ownerKey(entry.key), m.epochKey(entry.key)},
-					entry.connectionID,
-					m.sessionTTL.Milliseconds(),
-					m.sessionTTL.Milliseconds()*epochKeyTTLFactor,
-				).Int()
-				cancel()
-				if err != nil {
-					// Redis 不可用时不能无限信任本地状态：连续失败达到阈值后
-					// 才 fail-closed，单次抖动只记录告警并等待下一轮续租。
-					failures := entry.renewFailures.Add(1)
-					log.Warn(
-						"连接续租失败: key=%s, connection=%s, failures=%d/%d, err=%v",
-						entry.key,
-						entry.connectionID,
-						failures,
-						maxRenewFailures,
-						err,
-					)
-					if failures >= maxRenewFailures {
-						m.closeConnection(entry, "connection ownership unavailable", err)
-					}
-					continue
-				}
-				entry.renewFailures.Store(0)
-				if renewed != 1 {
-					m.closeConnection(entry, "connection replaced", nil)
-				}
-			}
+			forEachConnection(m.ctx, m.connectionSnapshot(), m.renewConnection)
 		}
 	}
 }
 
-func (m *Manager) closeConnection(entry *Handle, reason string, cause error) {
-	// 已主动注销的连接由调用方负责关闭，这里不再重复回调。
-	if entry.released.Load() {
+func (m *Manager) renewConnection(ctx context.Context, entry *Handle) {
+	// 快照可能包含本轮 tick 之前已被 Unregister 的连接，跳过。
+	if entry.state.Load() != leaseActive {
 		return
 	}
-	// 必须先失效本地状态；即使 WebSocket 关闭需要时间，后续消息也会立即被拒绝。
-	entry.active.Store(false)
-	entry.closeOnce.Do(func() {
-		if cause != nil {
-			log.Error(
-				"连接所有权检查失败，关闭连接: key=%s, connection=%s, reason=%s, err=%v",
-				entry.key,
-				entry.connectionID,
-				reason,
-				cause,
-			)
-		} else {
-			log.Warn(
-				"连接所有权已失效，关闭连接: key=%s, connection=%s, reason=%s",
-				entry.key,
-				entry.connectionID,
-				reason,
-			)
+	if !entry.Active() {
+		m.closeConnection(entry, "connection ownership expired", nil)
+		return
+	}
+	started := time.Now()
+	callCtx, cancel := withRedisTimeout(ctx)
+	renewed, err := renewScript.Run(
+		callCtx,
+		m.client,
+		[]string{m.ownerKey(entry.key), m.epochKey(entry.key)},
+		entry.connectionID,
+		m.sessionTTL.Milliseconds(),
+	).Int()
+	cancel()
+	if ctx.Err() != nil || entry.state.Load() != leaseActive {
+		return
+	}
+	if err != nil {
+		// 单次续租失败时保留现有租约，连续失败或本地租约到期时关闭连接。
+		failures := entry.renewFailures.Add(1)
+		log.Warn("连接续租失败: key=%s, connection=%s, failures=%d/%d, err=%v",
+			entry.key, entry.connectionID, failures, maxRenewFailures, err)
+		if failures >= maxRenewFailures || !entry.Active() {
+			m.closeConnection(entry, "connection ownership unavailable", err)
 		}
+		return
+	}
+	entry.renewFailures.Store(0)
+	if renewed != 1 {
+		m.closeConnection(entry, "connection replaced", nil)
+		return
+	}
+	until := started.Add(m.sessionTTL)
+	entry.validUntil.Store(&until)
+	if !entry.Active() {
+		m.closeConnection(entry, "connection ownership expired", nil)
+	}
+}
+
+func (m *Manager) closeConnection(entry *Handle, reason string, cause error) {
+	// Pending registrations return ErrOwnershipLost. Only an active handle runs the close callback.
+	if entry.state.Swap(leaseInactive) != leaseActive {
+		return
+	}
+	if cause != nil {
+		log.Error("连接所有权检查失败，关闭连接: key=%s, connection=%s, reason=%s, err=%v",
+			entry.key, entry.connectionID, reason, cause)
+	} else {
+		log.Warn("连接所有权已失效，关闭连接: key=%s, connection=%s, reason=%s",
+			entry.key, entry.connectionID, reason)
+	}
+	go func() {
+		defer func() {
+			if value := recover(); value != nil {
+				log.Error("连接关闭回调 panic: key=%s, connection=%s, reason=%s, panic=%v",
+					entry.key, entry.connectionID, reason, value)
+			}
+		}()
 		entry.close(reason)
-	})
+	}()
 }
 
 func (m *Manager) connectionByID(connectionID string) *Handle {
@@ -739,7 +830,7 @@ func (m *Manager) removeConnection(handle *Handle) *Handle {
 		return nil
 	}
 	delete(m.byConnectionID, entry.connectionID)
-	entry.released.Store(true)
+	entry.state.Store(leaseInactive)
 	return entry
 }
 
